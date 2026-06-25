@@ -1178,7 +1178,10 @@ int32_t tokenize(char **restrict stringp, char *restrict delim, char **restrict 
 }
 
 void spinLock(volatile atomic_int *lock) {
-    atomic_int expected;
+    // C11 atomic_compare_exchange_weak's "expected" parameter is the
+    // non-atomic type (int*, not atomic_int*) per the standard -- glibc's
+    // headers tolerate the atomic_int form, Apple's Clang correctly rejects it.
+    int expected;
     int calls = 0;
     do {
         expected = 0;

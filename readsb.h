@@ -435,6 +435,7 @@ static inline void *calloc_or_exit(size_t alignment, size_t size, const char *fi
 #define CM_NO_HUGEPAGE 0
 
 static inline void *mmap_or_exit(size_t size, int huge, const char *file, int line) {
+    (void) huge; // only referenced under #ifdef MADV_HUGEPAGE below -- unused on platforms without it (e.g. macOS)
     void *buf = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (buf == MAP_FAILED) {
         fprintf(stderr, "FATAL: cmMmap() of size %lld failed: %s:%d (%s)\n", (long long) size, file, line, strerror(errno));
