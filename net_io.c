@@ -5143,7 +5143,9 @@ static int readBeast(struct client *c, int64_t now, struct messageBuffer *mb) {
             p++;
 
             int64_t ts;
-            if (p + sizeof(int64_t) > c->eod) {
+            // need the byte after the timestamp too: it is read below, and if the buffer ended
+            // at the timestamp that byte is stale, which skipped the next message
+            if (p + sizeof(int64_t) >= c->eod) {
                 break;
             }
 
