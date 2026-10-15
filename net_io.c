@@ -1539,7 +1539,7 @@ static int flushClient(struct client *c, int64_t now) {
             return -1;
         }
     }
-    if (bytesWritten < toWrite) {
+    if (bytesWritten < toWrite && !Modes.synthetic_now) {
         dropHalfUntil(now, c, now + 2 * SECONDS);
     }
     if (bytesWritten > toWrite) {
@@ -1579,13 +1579,45 @@ static int flushClient(struct client *c, int64_t now) {
 
     // if we haven't been able to send any data on this connection for 2 seconds, drop it
     int64_t sendTimeout = 5 * SECONDS;
-    if (now - c->last_send > sendTimeout && now - c->connectedSince > 15 * SECONDS) {
+    // with synthetic time (a replay) 5 s pass in milliseconds; waitForSendRoom() handles slow clients instead
+    if (now - c->last_send > sendTimeout && now - c->connectedSince > 15 * SECONDS && !Modes.synthetic_now) {
         fprintf(stderr, "%s: Couldn't send any data for %.2fs (Insufficient bandwidth?): disconnecting: %s port %s (fd %d, SendQ %d)\n", c->service->descr, sendTimeout / 1000.0, c->host, c->port, c->fd, c->sendq_len);
         modesCloseClient(c);
         return -1;
     }
 
     return bytesWritten;
+}
+
+//
+// With synthetic time (a replay) a slow client must not lose data: dropping depends on
+// how fast the client reads, so two replays of the same file would differ.
+// Wait (in real time) for the client to take enough of its queue that len more bytes fit.
+// While we wait no input is read, so the slowdown reaches the sender through TCP.
+// Returns 0 when there is room, -1 if the client was closed or made no progress for 60 s.
+//
+static int waitForSendRoom(struct client *c, int len, int64_t now) {
+    int64_t stalledMs = 0;
+    while (c->service && c->sendq_len + len > c->sendq_max) {
+        int before = c->sendq_len;
+        struct pollfd pfd = { .fd = c->fd, .events = POLLOUT };
+        int ready = poll(&pfd, 1, 100);
+        if (ready < 0 && errno != EINTR) {
+            return -1;
+        }
+        if (flushClient(c, now) < 0 || !c->service) {
+            return -1;
+        }
+        if (c->sendq_len < before) {
+            stalledMs = 0;
+        } else if ((stalledMs += 100) >= 60 * SECONDS) {
+            fprintf(stderr, "%s: replay: client took no data for 60 s, disconnecting: %s port %s (fd %d, SendQ %d)\n",
+                    c->service->descr, c->host, c->port, c->fd, c->sendq_len);
+            modesCloseClient(c);
+            return -1;
+        }
+    }
+    return c->service ? 0 : -1;
 }
 
 //
@@ -1616,6 +1648,10 @@ static void flushWrites(struct net_writer *writer) {
             }
 
             c->bytesFromWriter += writer->dataUsed;
+
+            if (Modes.synthetic_now && waitForSendRoom(c, writer->dataUsed, now) < 0) {
+                continue;
+            }
 
             int bufferInsufficient = (c->sendq_len + writer->dataUsed > c->sendq_max);
 
