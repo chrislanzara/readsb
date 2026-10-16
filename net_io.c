@@ -1630,6 +1630,15 @@ static void flushWrites(struct net_writer *writer) {
         return;
     }
     int64_t now = mstime();
+    if (Modes.replay_sbs_out && writer == &Modes.sbs_out) {
+        if (fwrite(writer->data, 1, writer->dataUsed, Modes.replay_sbs_out) != (size_t) writer->dataUsed) {
+            fprintf(stderr, "<3>replay: writing %s failed: %s\n", Modes.replay_sbs_file, strerror(errno));
+            setExit(2);
+        }
+        writer->dataUsed = 0;
+        writer->lastWrite = now;
+        return;
+    }
     if (0 && Modes.debug_flush) {
         fprintTimePrecise(stderr, now);
         fprintf(stderr, " %s: flushWrites %5d bytes\n", writer->service->descr, writer->dataUsed);
@@ -3446,8 +3455,13 @@ static void modesSendSBSOutput(struct modesMessage *mm, struct aircraft *a, stru
     // Fields 1 to 6 : SBS message type and ICAO address of the aircraft and some other stuff
     p += sprintf(p, "MSG,%d,1,1,%s%06X,1,", msgType, (a->addr & MODES_NON_ICAO_ADDRESS) ? "~" : "", a->addr & 0xFFFFFF);
 
-    // Find current system time
-    clock_gettime(CLOCK_REALTIME, &now);
+    // Find current system time; in a replay, the message's time, so the output depends only on the input
+    if (Modes.replay_sbs_file) {
+        now.tv_sec = mm->sysTimestamp / 1000;
+        now.tv_nsec = (mm->sysTimestamp % 1000) * 1000000;
+    } else {
+        clock_gettime(CLOCK_REALTIME, &now);
+    }
     gmtime_r(&now.tv_sec, &stTime_now);
 
     // Find message reception time
@@ -6137,7 +6151,11 @@ static void cleanupService(struct net_service *s) {
     while (c) {
         nc = c->next;
 
-        anetCloseSocket(c->fd);
+        if (c->serial) {
+            close(c->fd); // not a socket, as in modesCloseClient
+        } else {
+            anetCloseSocket(c->fd);
+        }
         c->sendq_len = 0;
         sfree(c->sendq);
         sfree(c->buf);
@@ -6499,8 +6517,106 @@ void netUseMessage(struct modesMessage *mm) {
         exit(1);
     }
     buf->len++;
-    if (buf->len == buf->alloc) {
+    // in a replay each message is tracked and output before the next is decoded, so the
+    // result doesn't depend on which messages arrived in the same read
+    if (buf->len == buf->alloc || Modes.replay_sbs_file) {
         drainMessageBuffer(buf);
+    }
+}
+
+//
+// --replay-to-sbs: decode a --dump-beast stream from stdin and write its SBS output to a file.
+// The output depends only on the input:
+//   - stdin is read in full buffers, so where a read ends depends only on the stream
+//   - each message is tracked and output before the next is decoded (netUseMessage)
+//   - housekeeping runs between messages on the recorded time (readBeast); the upkeep and
+//     misc threads leave it alone, and nothing else runs on the real clock
+//   - the receiver id and random() are fixed
+// stdin should be a pipe, e.g. zstd -dc *.zst | readsb --replay-to-sbs=out.sbs
+//
+void replayBeastToSbs(void) {
+    if (strcmp(Modes.replay_sbs_file, "-") == 0) {
+        Modes.replay_sbs_out = stdout;
+    } else {
+        Modes.replay_sbs_out = fopen(Modes.replay_sbs_file, "w");
+    }
+    if (!Modes.replay_sbs_out) {
+        fprintf(stderr, "<3>replay: can't open %s: %s\n", Modes.replay_sbs_file, strerror(errno));
+        setExit(2);
+        return;
+    }
+
+    srandom(1);
+
+    struct client *c = createSocketClient(Modes.beast_in_service, STDIN_FILENO, NULL);
+    // read here, not through epoll
+    epoll_ctl(Modes.net_epfd, EPOLL_CTL_DEL, c->fd, &c->epollEvent);
+    c->receiverId = 0;
+    c->receiverId2 = 0;
+    c->buflen = 0;
+    c->serial = 1; // not a socket: closed with close()
+
+    // the SBS writer has no TCP clients in a replay; flushWrites writes its data to the file
+    Modes.sbs_out.connections++;
+
+    struct messageBuffer *mb = &Modes.netMessageBuffer[0];
+    int64_t bytesRead = 0;
+    int eof = 0;
+
+    while (!eof && !Modes.exit && c->service) {
+        // fill the buffer completely (fread only returns less at the end of the stream);
+        // leave 4 bytes for NUL termination, as readClient does
+        size_t want = c->bufmax - c->buflen - 4;
+        size_t got = fread(c->buf + c->buflen, 1, want, stdin);
+        if (got < want) {
+            if (ferror(stdin)) {
+                fprintf(stderr, "<3>replay: reading stdin failed: %s\n", strerror(errno));
+                setExit(2);
+                break;
+            }
+            eof = 1;
+        }
+        bytesRead += got;
+        c->buflen += got;
+        if (c->buflen == 0) {
+            break;
+        }
+        c->som = c->buf;
+        c->eod = c->buf + c->buflen;
+        *c->eod = '\0';
+
+        mb->activeClient = c;
+        processClient(c, Modes.synthetic_now ? Modes.synthetic_now : mstime(), mb);
+        drainMessageBuffer(mb);
+        mb->activeClient = NULL;
+
+        if (!c->service) {
+            break;
+        }
+        // keep what wasn't parsed (an incomplete message) for the next pass
+        c->buflen = c->eod - c->som;
+        if (c->buflen > 0) {
+            memmove(c->buf, c->som, c->buflen);
+        }
+        if (c->buflen >= c->bufmax - 4) {
+            fprintf(stderr, "<3>replay: a full buffer without a complete message, the input isn't a --dump-beast stream\n");
+            setExit(2);
+            break;
+        }
+    }
+
+    flushWrites(&Modes.sbs_out);
+    if (Modes.replay_sbs_out != stdout) {
+        fclose(Modes.replay_sbs_out);
+    } else {
+        fflush(stdout);
+    }
+    Modes.replay_sbs_out = NULL;
+
+    fprintf(stderr, "replay: %lld bytes read, %lld bytes of garbage, %u bytes left unparsed at the end\n",
+            (long long) bytesRead, (long long) c->garbage, (unsigned) c->buflen);
+    if (!Modes.exit) {
+        setExit(1);
     }
 }
 

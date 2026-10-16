@@ -238,6 +238,7 @@ typedef union __packed {
 } hulc_status_msg_t;
 
 void netUseMessage(struct modesMessage *mm);
+void replayBeastToSbs(void);
 void netDrainMessageBuffers();
 struct modesMessage *netGetMM(struct messageBuffer *buf);
 

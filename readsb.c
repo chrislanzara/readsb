@@ -477,7 +477,7 @@ void priorityTasksRun() {
 
     static int64_t last_periodic_mono;
     int64_t periodic_interval = mono - last_periodic_mono;
-    if (periodic_interval > 5 * SECONDS && periodic_interval < 9999 * HOURS && last_periodic_mono && !(Modes.syntethic_now_suppress_errors && Modes.synthetic_now)) {
+    if (periodic_interval > 5 * SECONDS && periodic_interval < 9999 * HOURS && last_periodic_mono && !(Modes.syntethic_now_suppress_errors && Modes.synthetic_now) && !Modes.replay_sbs_file) {
         fprintf(stderr, "<3> priorityTasksRun didn't run for %.1f seconds!\n", periodic_interval / 1000.0);
     }
     last_periodic_mono = mono;
@@ -507,7 +507,7 @@ void priorityTasksRun() {
         traceDelete();
 
         int64_t interval = mono - Modes.next_remove_stale;
-        if (interval > 5 * SECONDS && interval < 9999 * HOURS && Modes.next_remove_stale && !(Modes.syntethic_now_suppress_errors && Modes.synthetic_now)) {
+        if (interval > 5 * SECONDS && interval < 9999 * HOURS && Modes.next_remove_stale && !(Modes.syntethic_now_suppress_errors && Modes.synthetic_now) && !Modes.replay_sbs_file) {
             fprintf(stderr, "<3> removeStale didn't run for %.1f seconds!\n", interval / 1000.0);
         }
 
@@ -1010,7 +1010,13 @@ static void *decodeEntryPoint(void *arg) {
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     int64_t now = mstime();
-    if (Modes.net_only) {
+    if (Modes.replay_sbs_file) {
+        // reads stdin to its end, then asks readsb to exit
+        replayBeastToSbs();
+        while (!Modes.exit) {
+            threadTimedWait(&Threads.decode, &ts, 100);
+        }
+    } else if (Modes.net_only) {
         while (!Modes.exit) {
             struct timespec start_time;
 
@@ -1298,7 +1304,10 @@ static void *upkeepEntryPoint(void *arg) {
 
     while (!Modes.exit) {
 
-        priorityTasksRun();
+        // in a replay, housekeeping runs only between messages, from the decode thread
+        if (!Modes.replay_sbs_file) {
+            priorityTasksRun();
+        }
 
         if (Modes.writeTraces) {
             // writing a trace takes some time, to increase timing precision the priority tasks, allot a little less time than available
@@ -1855,6 +1864,13 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state) {
 
                 sfree(argdup);
             }
+            break;
+        case OptReplayToSbs:
+            sfree(Modes.replay_sbs_file);
+            Modes.replay_sbs_file = strdup(arg);
+            Modes.net = 1;
+            Modes.quiet = 1;
+            Modes.dump_accept_synthetic_now = 1;
             break;
         case OptGlobeHistoryDir:
             sfree(Modes.globe_history_dir);
@@ -3010,7 +3026,9 @@ static void *miscEntryPoint(void *arg) {
         int64_t now = mstime();
 
         // function can unlock / lock misc mutex
-        miscStuff(now);
+        if (!Modes.replay_sbs_file) {
+            miscStuff(now);
+        }
 
         end_cpu_timing(&start_time, &Modes.stats_current.heatmap_and_state_cpu);
 

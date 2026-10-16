@@ -896,6 +896,8 @@ struct _Modes
     char *state_dir;
     char *state_parent_dir;
     char *dump_beast_dir; // write raw beast with a timestamp every millisecond for low level replay
+    char *replay_sbs_file; // --replay-to-sbs: decode a --dump-beast stream from stdin, write SBS here, exit at its end
+    FILE *replay_sbs_out;
     zstd_fw_t *dump_fw;
     int64_t dump_next_ts; // last timestamp sent
     int32_t dump_interval;
@@ -1309,6 +1311,7 @@ enum {
     OptHeatmap,
     OptHeatmapDir,
     OptDumpBeastDir,
+    OptReplayToSbs,
     OptJsonTime,
     OptJsonLocAcc,
     OptJsonGlobeIndex,

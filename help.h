@@ -109,6 +109,7 @@ static struct argp_option optionsReadsb[] = {
     {"write-state-only-on-exit", OptStateOnlyOnExit, 0, 0, "Don't continously update state.", 1},
     {"heatmap-dir", OptHeatmapDir, "<dir>", 0, "Change the directory where heatmaps are saved (default is in globe history dir)", 1},
     {"heatmap", OptHeatmap, "<interval in seconds>", 0, "Make Heatmap, each aircraft at most every interval seconds (creates historydir/heatmap.bin and exit after that)", 1},
+    {"replay-to-sbs", OptReplayToSbs, "<file>", 0, "Read a --dump-beast stream (decompressed) from stdin, write its SBS output to <file> (- for stdout) and exit at the end of the stream; the output depends only on the input", 1},
     {"dump-beast", OptDumpBeastDir, "<dir>,<interval>,<compressionLevel>", 0, "Dump compressed beast files to this directory, start a new file evey interval seconds", 1},
     {"write-json-every", OptJsonTime, "<sec>", 0, "Write json output and update API json every sec seconds (default 1)", 1},
     {"json-location-accuracy", OptJsonLocAcc , "<n>", 0, "Accuracy of receiver location: 0: no location / internal use only, 1: 2 decimals, 2: exact (default), 3: 1 decimals, 4: 0 decimals", 1},
