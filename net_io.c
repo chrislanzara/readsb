@@ -3726,13 +3726,130 @@ basestation_invalid:
 //
 // Write SBS output to TCP clients
 //
+// --devel=sbs_status_types: the ADS-B status messages readsb decodes but SBS has no type for, as three
+// more types written as one hexadecimal character so a reader's fixed offsets still hold:
+//   MSG,9  TC 28 aircraft status, subtypes 1 (emergency/priority) and 2 (ACAS RA broadcast)
+//   MSG,A  TC 29 target state and status, version 1 (subtype 0, bit 11 clear) and version 2 (subtype 1)
+//   MSG,B  TC 31 operational status, subtypes 0 (airborne) and 1 (surface)
+// Any other subtype stays dropped. Returns 0 for those and for every other message.
+// The subtype is read from the ME field, and a line is written only when readsb's decoder filled in the
+// message's values: some DF18 formats (e.g. non-ICAO addresses with noise subtypes) are never decoded, and
+// mm->mesub is then still 0, which would pass as an airborne operational status.
+static int sbsStatusType(struct modesMessage *mm) {
+    if (mm->msgtype != 17 && mm->msgtype != 18)
+        return 0;
+    unsigned char *me = mm->ME;
+    switch (mm->metype) {
+        case 28: {
+            unsigned sub = getbits(me, 6, 8);
+            return ((sub == 1 && mm->emergency_valid) || (sub == 2 && mm->acas_ra_valid)) ? 9 : 0;
+        }
+        case 29: {
+            unsigned sub = getbits(me, 6, 7);
+            return ((sub == 1 || (sub == 0 && !getbit(me, 11))) && mm->accuracy.nac_p_valid) ? 10 : 0;
+        }
+        case 31: {
+            unsigned sub = getbits(me, 6, 8);
+            return ((sub == 0 || sub == 1) && mm->opstatus.valid) ? 11 : 0;
+        }
+        default:
+            return 0;
+    }
+}
+
+// Columns 25 onwards of a status line, each preceded by its comma; an empty column is a value the message
+// doesn't carry. Values come from readsb's decode (mode_s.c); where it keeps no validity flag, the same
+// bits its decoder checks say whether the value was sent. The last column is the 56-bit ME field in hex,
+// so whatever isn't decoded here is still on the line.
+static char *sbsStatusColumns(char *p, struct modesMessage *mm, int msgType) {
+    unsigned char *me = mm->ME;
+
+    // 25: subtype
+    p += sprintf(p, ",%u", mm->mesub);
+
+    if (msgType == 9 && mm->mesub == 1) {
+        // 26: emergency/priority code; 27-31: the RA columns, empty
+        p += sprintf(p, ",%u,,,,,", (unsigned) mm->emergency);
+    } else if (msgType == 9) {
+        // 26: empty; 27: active resolution advisories (14 bits, hex); 28: RA complement;
+        // 29: RA terminated; 30: multiple threat encounter; 31: threat's address when sent (TTI 1)
+        p += sprintf(p, ",,%04X,%u,%u,%u,", getbits(me, 9, 22), getbits(me, 23, 26), getbit(me, 27), getbit(me, 28));
+        if (getbits(me, 29, 30) == 1)
+            p += sprintf(p, "%06X", getbits(me, 31, 54));
+    } else if (msgType == 10) {
+        // 26: selected altitude (ft); 27: its source
+        if (mm->nav.mcp_altitude_valid)
+            p += sprintf(p, ",%u,MCP", mm->nav.mcp_altitude);
+        else if (mm->nav.fms_altitude_valid)
+            p += sprintf(p, ",%u,FMS", mm->nav.fms_altitude);
+        else
+            p += sprintf(p, ",,");
+        // 28: pressure setting (hPa); 29: selected heading (degrees)
+        p += mm->nav.qnh_valid ? sprintf(p, ",%.1f", mm->nav.qnh) : sprintf(p, ",");
+        p += mm->nav.heading_valid ? sprintf(p, ",%.1f", mm->nav.heading) : sprintf(p, ",");
+        // 30-35: autopilot, VNAV, altitude hold, approach, TCAS operational, LNAV; all empty when the
+        // aircraft marks its mode bits invalid
+        if (mm->nav.modes_valid) {
+            nav_modes_t m = mm->nav.modes;
+            p += sprintf(p, ",%d,%d,%d,%d,%d,%d",
+                    !!(m & NAV_MODE_AUTOPILOT), !!(m & NAV_MODE_VNAV), !!(m & NAV_MODE_ALT_HOLD),
+                    !!(m & NAV_MODE_APPROACH), !!(m & NAV_MODE_TCAS), !!(m & NAV_MODE_LNAV));
+        } else {
+            p += sprintf(p, ",,,,,,");
+        }
+        // 36: NACp; 37: NIC baro; 38: SIL
+        p += mm->accuracy.nac_p_valid ? sprintf(p, ",%u", mm->accuracy.nac_p) : sprintf(p, ",");
+        p += mm->accuracy.nic_baro_valid ? sprintf(p, ",%u", (unsigned) mm->accuracy.nic_baro) : sprintf(p, ",");
+        p += mm->accuracy.sil_type != SIL_INVALID ? sprintf(p, ",%u", mm->accuracy.sil) : sprintf(p, ",");
+        // 39: emergency/priority code (version 1 only)
+        p += (mm->mesub == 0 && mm->emergency_valid) ? sprintf(p, ",%u", (unsigned) mm->emergency) : sprintf(p, ",");
+    } else {
+        unsigned version = mm->opstatus.version;
+        int airborne = (mm->mesub == 0);
+        // 26: ADS-B version
+        p += sprintf(p, ",%u", version);
+        // 27: NIC supplement A; 28: NACp; 29: GVA
+        p += mm->accuracy.nic_a_valid ? sprintf(p, ",%u", (unsigned) mm->accuracy.nic_a) : sprintf(p, ",");
+        p += mm->accuracy.nac_p_valid ? sprintf(p, ",%u", mm->accuracy.nac_p) : sprintf(p, ",");
+        p += mm->accuracy.gva_valid ? sprintf(p, ",%u", mm->accuracy.gva) : sprintf(p, ",");
+        // 30: SIL; 31: SIL supplement
+        p += mm->accuracy.sil_type != SIL_INVALID ? sprintf(p, ",%u", mm->accuracy.sil) : sprintf(p, ",");
+        if (mm->accuracy.sil_type == SIL_PER_HOUR)
+            p += sprintf(p, ",hour");
+        else if (mm->accuracy.sil_type == SIL_PER_SAMPLE)
+            p += sprintf(p, ",sample");
+        else
+            p += sprintf(p, ",");
+        // 32: NIC baro (airborne)
+        p += mm->accuracy.nic_baro_valid ? sprintf(p, ",%u", (unsigned) mm->accuracy.nic_baro) : sprintf(p, ",");
+        // 33: heading reference (versions 1 and 2)
+        if (version >= 1 && version <= 2)
+            p += sprintf(p, ",%s", mm->opstatus.hrd == HEADING_MAGNETIC ? "magnetic" : "true");
+        else
+            p += sprintf(p, ",");
+        // 34: ACAS operational: airborne, when the capability class is in the format readsb reads
+        int cc_ok = airborne && getbits(me, 9, 10) == 0 && (version != 1 || getbits(me, 13, 14) == 0) && version <= 2;
+        p += cc_ok ? sprintf(p, ",%u", (unsigned) mm->opstatus.cc_acas) : sprintf(p, ",");
+        // 35: ACAS RA active: versions 1 and 2, operational mode format 0
+        int om_ok = version >= 1 && version <= 2 && getbits(me, 25, 26) == 0;
+        p += om_ok ? sprintf(p, ",%u", (unsigned) mm->opstatus.om_acas_ra) : sprintf(p, ",");
+        // 36: SDA; 37: length/width code (surface)
+        p += mm->accuracy.sda_valid ? sprintf(p, ",%u", mm->accuracy.sda) : sprintf(p, ",");
+        p += mm->opstatus.cc_lw_valid ? sprintf(p, ",%u", mm->opstatus.cc_lw) : sprintf(p, ",");
+    }
+
+    // last: the ME field
+    p += sprintf(p, ",%02X%02X%02X%02X%02X%02X%02X", me[0], me[1], me[2], me[3], me[4], me[5], me[6]);
+    return p;
+}
+
 static void modesSendSBSOutput(struct modesMessage *mm, struct aircraft *a, struct net_writer *writer) {
     char *p;
     struct timespec now;
     struct tm stTime_receive, stTime_now;
     int msgType;
 
-    p = prepareWrite(writer, Modes.sbs_extra_fields ? 260 : 200);
+    p = prepareWrite(writer, Modes.sbs_status_types ? 400 : (Modes.sbs_extra_fields ? 260 : 200));
     if (!p)
         return;
 
@@ -3778,6 +3895,8 @@ static void modesSendSBSOutput(struct modesMessage *mm, struct aircraft *a, stru
                     msgType = 3;
                 } else if (mm->metype == 19) {
                     msgType = 4;
+                } else if (Modes.sbs_status_types && (msgType = sbsStatusType(mm))) {
+                    // MSG,9 / A / B
                 } else {
                     return;
                 }
@@ -3789,7 +3908,12 @@ static void modesSendSBSOutput(struct modesMessage *mm, struct aircraft *a, stru
     }
 
     // Fields 1 to 6 : SBS message type and ICAO address of the aircraft and some other stuff
-    p += sprintf(p, "MSG,%d,1,1,%s%06X,1,", msgType, (a->addr & MODES_NON_ICAO_ADDRESS) ? "~" : "", a->addr & 0xFFFFFF);
+    if (msgType > 9) {
+        // MSG,A and MSG,B: the type stays one character, read as hexadecimal
+        p += sprintf(p, "MSG,%X,1,1,%s%06X,1,", msgType, (a->addr & MODES_NON_ICAO_ADDRESS) ? "~" : "", a->addr & 0xFFFFFF);
+    } else {
+        p += sprintf(p, "MSG,%d,1,1,%s%06X,1,", msgType, (a->addr & MODES_NON_ICAO_ADDRESS) ? "~" : "", a->addr & 0xFFFFFF);
+    }
 
     // Find current system time; in a replay, the message's time, so the output depends only on the input
     if (Modes.replay_sbs_file) {
@@ -3904,6 +4028,11 @@ static void modesSendSBSOutput(struct modesMessage *mm, struct aircraft *a, stru
 
     if (mm->mlatEPU) {
         p += sprintf(p, ",%d", mm->mlatEPU);
+    } else if (msgType >= 9 && !mm->sbs_in && mm->emergency_valid) {
+        // Field 20 on MSG,9 and MSG,A (version 1): also -1 for an emergency/priority code declared
+        // without a 7x00 squawk
+        int squawk7x00 = mm->squawk_valid && (mm->squawkHex == 0x7500 || mm->squawkHex == 0x7600 || mm->squawkHex == 0x7700);
+        p += sprintf(p, (mm->emergency != EMERGENCY_NONE || squawk7x00) ? ",-1" : ",0");
     } else if (mm->squawk_emergency_valid) {
         // Field 20 is the Squawk Emergency flag (if we have it)
         if (mm->squawk_emergency) {
@@ -3964,6 +4093,11 @@ static void modesSendSBSOutput(struct modesMessage *mm, struct aircraft *a, stru
             p += sprintf(p, ",%02X", mm->category);
         } else {
             p += sprintf(p, ",");
+        }
+
+        // Fields 25 onwards: the status lines' own columns (--devel=sbs_status_types)
+        if (msgType >= 9 && !mm->sbs_in) {
+            p = sbsStatusColumns(p, mm, msgType);
         }
     }
 

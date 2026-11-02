@@ -775,6 +775,7 @@ struct _Modes
     int8_t syntethic_now_suppress_errors;
     int8_t ifile_no_synthetic;
     int8_t sbs_extra_fields; // --devel=sbs_extra_fields: append RSSI (field 23) and aircraft category (field 24) to SBS output
+    int8_t sbs_status_types; // --devel=sbs_status_types: write ADS-B TC 28/29/31 as SBS MSG,9/A/B (needs sbs_extra_fields)
     int8_t json_age_fields; // --devel=json_age_fields: add various data ages (might add more)
     int8_t tar1090_use_api;
     int8_t verbose;

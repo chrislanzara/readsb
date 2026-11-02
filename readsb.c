@@ -2251,6 +2251,9 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state) {
                 if (strcasecmp(token[0], "sbs_extra_fields") == 0) {
                     Modes.sbs_extra_fields = 1;
                 }
+                if (strcasecmp(token[0], "sbs_status_types") == 0) {
+                    Modes.sbs_status_types = 1;
+                }
                 if (strcasecmp(token[0], "json_age_fields") == 0) {
                     // --devel=json_age_fields: add various data ages (might add more)
                     Modes.json_age_fields = 1;
@@ -2594,6 +2597,12 @@ int parseCommandLine(int argc, char **argv) {
 }
 
 static void configAfterParse() {
+    if (Modes.sbs_status_types && !Modes.sbs_extra_fields) {
+        // the status lines' own columns start at 25, after the extra fields 23 and 24
+        fprintf(stderr, "--devel=sbs_status_types needs --devel=sbs_extra_fields as well\n");
+        exit(1);
+    }
+
     Modes.sdr_buf_samples = Modes.sdr_buf_size / 2;
     Modes.trackExpireMax = Modes.trackExpireJaero + TRACK_EXPIRE_LONG + 1 * MINUTES;
 
