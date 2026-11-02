@@ -164,6 +164,7 @@ static void configSetDefaults(void) {
     Modes.net_input_beast_ports = strdup("0");
     Modes.net_input_planefinder_ports = strdup("0");
     Modes.net_output_beast_ports = strdup("0");
+    Modes.net_output_kinetic_ports = strdup("0");
     Modes.net_output_beast_reduce_ports = strdup("0");
     Modes.net_output_beast_reduce_interval = 250;
     Modes.beast_reduce_filter_altitude = -1;
@@ -523,6 +524,19 @@ void priorityTasksRun() {
     if (Modes.updateStats) {
         Modes.currentTask = "statsUpdate";
         statsUpdate(now); // needs to happen under lock
+    }
+
+
+    if (Modes.net) {
+        static int64_t next_free_clients;
+        int64_t free_client_interval = 1 * SECONDS;
+        if (now > next_free_clients) {
+            next_free_clients = now + free_client_interval;
+
+            // this can't happen at the same time as generateClientsJson and generateReceiversJson
+            // thus it has been moved to this section where all other threads are locked
+            netFreeClientsReceivers(free_client_interval);
+        }
     }
 
     int64_t elapsed2 = lapWatch(&watch);
@@ -1449,6 +1463,9 @@ static void cleanup_and_exit(int code) {
     sfree(Modes.net_input_beast_ports);
     sfree(Modes.net_input_planefinder_ports);
     sfree(Modes.net_output_beast_ports);
+    sfree(Modes.net_output_kinetic_ports);
+    sfree(Modes.net_kinetic_filter_category);
+    sfree(Modes.net_kinetic_filter_hexcode);
     sfree(Modes.net_output_beast_reduce_ports);
     sfree(Modes.net_output_vrs_ports);
     sfree(Modes.net_input_raw_ports);
@@ -1464,7 +1481,6 @@ static void cleanup_and_exit(int code) {
     sfree(Modes.net_output_asterix_ports);
     sfree(Modes.garbage_ports);
     sfree(Modes.beast_serial);
-    sfree(Modes.uuidFile);
     sfree(Modes.dbIndex);
     sfree(Modes.dbRaw.buffer);
     sfree(Modes.db);
@@ -1760,7 +1776,9 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state) {
             int count = parseLongs(arg, dfs, dfs_size);
             for (int i = 0; i < count; i++)
             {
-                Modes.filterDFbitset |= (1 << dfs[i]);
+                // DF is a 5 bit field, anything else is not a valid filter value
+                if (dfs[i] >= 0 && dfs[i] < 32)
+                    Modes.filterDFbitset |= (1u << dfs[i]);
             }
             fprintf(stderr, "filter-DF: %s\n", arg);
 #undef dfs_size
@@ -1999,6 +2017,21 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state) {
             sfree(Modes.net_output_beast_ports);
             Modes.net_output_beast_ports = strdup(arg);
             break;
+        case OptNetKineticPorts:
+            sfree(Modes.net_output_kinetic_ports);
+            Modes.net_output_kinetic_ports = strdup(arg);
+            break;
+        case OptNetKineticForwardMlat:
+            Modes.forward_mlat_kinetic = 1;
+            break;
+        case OptNetKineticFilterCategory:
+            sfree(Modes.net_kinetic_filter_category);
+            Modes.net_kinetic_filter_category = strdup(arg);
+            break;
+        case OptNetKineticFilterHexcode:
+            sfree(Modes.net_kinetic_filter_hexcode);
+            Modes.net_kinetic_filter_hexcode = strdup(arg);
+            break;
         case OptNetBiPorts:
             sfree(Modes.net_input_beast_ports);
             Modes.net_input_beast_ports = strdup(arg);
@@ -2120,8 +2153,24 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state) {
             Modes.netIngest = 1;
             break;
         case OptUuidFile:
-            sfree(Modes.uuidFile);
-            Modes.uuidFile = strdup(arg);
+            {
+                // COMPAT note: do not error exit no matter the file validity
+                int fd = open(arg, O_RDONLY);
+                if (fd == -1) {
+                    fprintf(stderr, "ERRROR: --uuid-file could not be opened! (%s)", strerror(errno));
+                } else {
+                    int res = read(fd, Modes.uuid, sizeof(Modes.uuid));
+                    if (res == -1) {
+                        fprintf(stderr, "ERRROR: --uuid-file could not be read! (%s)", strerror(errno));
+                    }
+                    close(fd);
+                }
+                Modes.uuid[sizeof(Modes.uuid) - 1] = '\0';
+            }
+            break;
+        case OptUuid:
+            strncpy(Modes.uuid, arg, sizeof(Modes.uuid));
+            Modes.uuid[sizeof(Modes.uuid) - 1] = '\0';
             break;
         case OptNetConnector:
             if (make_net_connector(arg)) {
@@ -2201,6 +2250,10 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state) {
                 }
                 if (strcasecmp(token[0], "sbs_extra_fields") == 0) {
                     Modes.sbs_extra_fields = 1;
+                }
+                if (strcasecmp(token[0], "json_age_fields") == 0) {
+                    // --devel=json_age_fields: add various data ages (might add more)
+                    Modes.json_age_fields = 1;
                 }
                 if (strcasecmp(token[0], "beast_dated_dirs") == 0) {
                     Modes.beast_dated_dirs = 1;
@@ -2699,6 +2752,10 @@ static void configAfterParse() {
     if (Modes.net_sndbuf_size > (MODES_NET_SNDBUF_MAX)) {
         fprintf(stderr, "automatically clamping --net-buffer to 7 which is %d bytes\n", MODES_NET_SNDBUF_SIZE << MODES_NET_SNDBUF_MAX);
         Modes.net_sndbuf_size = MODES_NET_SNDBUF_MAX;
+    }
+    if (Modes.net_sndbuf_size < 0) {
+        fprintf(stderr, "automatically clamping --net-buffer to 0 which is %d bytes\n", MODES_NET_SNDBUF_SIZE);
+        Modes.net_sndbuf_size = 0;
     }
 
     Modes.netBufSize = MODES_NET_SNDBUF_SIZE << Modes.net_sndbuf_size;
@@ -3235,12 +3292,12 @@ int main(int argc, char **argv) {
         }
     }
 
-    if (Modes.json_globe_index && !Modes.omitGlobeFiles) {
-        threadCreate(&Threads.globeBin, NULL, globeBinEntryPoint, NULL);
-    }
-
     if (Modes.json_dir) {
         threadCreate(&Threads.json, NULL, jsonEntryPoint, NULL);
+
+        if (Modes.json_globe_index && !Modes.omitGlobeFiles) {
+            threadCreate(&Threads.globeBin, NULL, globeBinEntryPoint, NULL);
+        }
 
         if (Modes.json_globe_index && !Modes.omitGlobeFiles && !Modes.tar1090_no_globe) {
             // globe_xxxx.json
@@ -3346,20 +3403,14 @@ int main(int argc, char **argv) {
 
     threadSignalJoin(&Threads.misc);
 
-    if (Modes.sdr_type != SDR_NONE) {
-        threadSignalJoin(&Threads.reader);
-    }
+    threadSignalJoin(&Threads.reader);
 
     threadSignalJoin(&Threads.upkeep);
 
-    if (Modes.json_dir) {
-        threadSignalJoin(&Threads.json);
+    threadSignalJoin(&Threads.json);
 
-        if (Modes.json_globe_index) {
-            threadSignalJoin(&Threads.globeJson);
-            threadSignalJoin(&Threads.globeBin);
-        }
-    }
+    threadSignalJoin(&Threads.globeJson);
+    threadSignalJoin(&Threads.globeBin);
 
     // after miscThread for the moment
     if (Modes.api) {

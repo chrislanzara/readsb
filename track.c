@@ -64,7 +64,7 @@ static void showPositionDebug(struct aircraft *a, struct modesMessage *mm, int64
 static void position_bad(struct modesMessage *mm, struct aircraft *a);
 static void calc_wind(struct aircraft *a, struct modesMessage *mm, int64_t now);
 static void calc_temp(struct aircraft *a, int64_t now);
-static inline int declination(struct aircraft *a, double *dec, int64_t now);
+static inline int updateDeclination(struct aircraft *a, int64_t now);
 static const char *source_string(datasource_t source);
 static void incrementReliable(struct aircraft *a, struct modesMessage *mm, int64_t now, int odd);
 
@@ -579,11 +579,12 @@ static int speed_check(struct aircraft *a, datasource_t source, double lat, doub
             track_diff = fabs(norm_diff(track - calc_track, 180));
         }
     }
-
-    if (track_diff > 70.0f && speed > 10) {
-        mm->trackUnreliable = +1;
-    } else if (track_diff > -1) {
-        mm->trackUnreliable = -1;
+    if (track_diff > -1) {
+        if (track_diff > 70.0f && speed > 10) {
+            mm->trackUnreliable = +1;
+        } else {
+            mm->trackUnreliable = -1;
+        }
     }
 
     if (!posReliable(a)) {
@@ -597,7 +598,7 @@ static int speed_check(struct aircraft *a, datasource_t source, double lat, doub
 
     if (speed > 10 && track_diff > -1 && a->trackUnreliable < 8) {
         track_bonus = speed * (90.0f - track_diff) / 90.0f;
-        track_bonus *= (surface ? 0.9f : 1.0f) * (1.0f - track_age / track_max_age);
+        track_bonus *= (surface ? 0.9f : 1.0f) * (1.0f - (float) track_age / track_max_age);
         if (a->gs < 10) {
             // don't allow negative "bonus" below 10 knots speed
             track_bonus = fmaxf(0.0f, track_bonus);
@@ -819,7 +820,8 @@ static int doGlobalCPR(struct aircraft *a, struct modesMessage *mm, double *lat,
                 a->cpr_odd_lat, a->cpr_odd_lon,
                 fflag,
                 lat, lon);
-        double refDistance = greatcircle(reflat, reflon, *lat, *lon, 0);
+        // lat / lon are only set when the decode succeeded
+        double refDistance = (result == 0) ? greatcircle(reflat, reflon, *lat, *lon, 0) : 0;
         if (refDistance > 450e3) {
             if (0 && (a->addr == Modes.cpr_focus || Modes.debug_cpr)) {
                 fprintf(stderr, "%06x CPRsurface ref %d refDistance: %4.0f km (%4.0f, %4.0f) allow_ac_rel %d\n", a->addr, ref, refDistance / 1000.0, reflat, reflon, a->surfaceCPR_allow_ac_rel);
@@ -2335,6 +2337,9 @@ struct aircraft *trackUpdateFromMessage(struct modesMessage *mm) {
         a->geom_delta = mm->geom_delta;
     }
 
+    if (0 && mm->wind_valid) {
+        fprintf(stderr, "mm->wind_valid %06x ws %3.0f wd %3.0f\n", a->addr, mm->wind_speed, mm->wind_direction);
+    }
     if (mm->heading_valid) {
         heading_type_t htype = mm->heading_type;
         if (htype == HEADING_MAGNETIC_OR_TRUE) {
@@ -2345,23 +2350,25 @@ struct aircraft *trackUpdateFromMessage(struct modesMessage *mm) {
 
         if (htype == HEADING_GROUND_TRACK && accept_data(&a->track_valid, mm->source, mm, a, REDUCE_OFTEN)) {
             a->track = mm->heading;
+            calc_wind(a, mm, now);
         } else if (htype == HEADING_MAGNETIC) {
-            double dec;
-            int err = declination(a, &dec, now);
             if (accept_data(&a->mag_heading_valid, mm->source, mm, a, REDUCE_OFTEN)) {
                 a->mag_heading = mm->heading;
 
+                int err = updateDeclination(a, now);
+
                 // don't accept more than 45 degree crab when deriving the true heading
                 if (
-                        (!trackDataValid(&a->track_valid) || fabs(norm_diff(mm->heading + dec - a->track, 180)) < 45)
+                        (!trackDataValid(&a->track_valid) || fabs(norm_diff(mm->heading + a->magneticDeclination - a->track, 180)) < 45)
                         && !err && accept_data(&a->true_heading_valid, SOURCE_INDIRECT, mm, a, REDUCE_OFTEN)
                    ) {
-                    a->true_heading = norm_angle(mm->heading + dec, 180);
+                    a->true_heading = norm_angle(mm->heading + a->magneticDeclination, 180);
                     calc_wind(a, mm, now);
                 }
             }
         } else if (htype == HEADING_TRUE && accept_data(&a->true_heading_valid, mm->source, mm, a, REDUCE_OFTEN)) {
             a->true_heading = mm->heading;
+            calc_wind(a, mm, now);
         }
     }
 
@@ -2385,7 +2392,7 @@ struct aircraft *trackUpdateFromMessage(struct modesMessage *mm) {
     }
 
     if (mm->tas_valid
-            && !(trackDataValid(&a->ias_valid) && mm->tas < a->ias)
+            && !(trackDataValid(&a->ias_valid) && (float) mm->tas < 0.7 * a->ias)
             && accept_data(&a->tas_valid, mm->source, mm, a, REDUCE_OFTEN)) {
         a->tas = mm->tas;
         calc_temp(a, now);
@@ -2694,7 +2701,7 @@ struct aircraft *trackUpdateFromMessage(struct modesMessage *mm) {
             // avoid using already received positions for JAERO input
         } else if (mm->receiver_distance > Modes.maxRange && mm->source != SOURCE_JAERO) {
             // ignore positions out of receiver range unless it's jaero
-        } else if (mm->source == SOURCE_MLAT && mm->mlatEPU > 2 * a->mlatEPU
+        } else if (mm->source == SOURCE_MLAT && a->mlatEPU > 0 && mm->mlatEPU > 2 * a->mlatEPU
                 && imin((int)(3000.0f * logf((float)mm->mlatEPU / (float)a->mlatEPU)), TRACE_STALE * 3 / 4) > (int64_t) trackDataAge(mm->sysTimestamp, &a->pos_reliable_valid)
                 ) {
             // don't use less accurate MLAT positions unless some time has elapsed
@@ -2939,7 +2946,7 @@ exit:
             || (Modes.debug_7700 && ac && ac->squawk == 0x7700 && trackDataValid(&ac->squawk_valid))
        ) {
         // filter messages with unwanted DF types (sbs_in are unknown DF type, filter them all, this is arbitrary but no one cares anyway)
-        if (!(Modes.filterDF && (mm->sbs_in || !(Modes.filterDFbitset & (1 << mm->msgtype))))) {
+        if (!(Modes.filterDF && (mm->sbs_in || !(Modes.filterDFbitset & (1u << mm->msgtype))))) {
             displayModesMessage(mm);
         }
     }
@@ -3356,27 +3363,45 @@ static void adjustExpire(struct aircraft *a, int64_t timeout) {
 */
 
 static void calc_wind(struct aircraft *a, struct modesMessage *mm, int64_t now) {
-    uint32_t focus = 0xc0ffeeba;
-
-    if (a->addr == focus)
-        fprintf(stderr, "%"PRIu64" %"PRIu64" %"PRIu64" %"PRIu64"\n", trackDataAge(now, &a->tas_valid), trackDataAge(now, &a->true_heading_valid),
-                trackDataAge(now, &a->gs_valid), trackDataAge(now, &a->track_valid));
-
-    if (!trackDataValid(&a->position_valid) || a->airground == AG_GROUND)
+    if (a->airground == AG_GROUND)
         return;
-
-    if (now < a->wind_updated + 1 * SECONDS) {
-        // don't do wind calculation more often than necessary, precision isn't THAT good anyhow
-        return;
-    }
 
     if (trackDataAge(now, &a->tas_valid) > TRACK_WT_TIMEOUT
             || trackDataAge(now, &a->gs_valid) > TRACK_WT_TIMEOUT
-            || trackDataAge(now, &a->track_valid) > TRACK_WT_TIMEOUT / 2
             || trackDataAge(now, &a->true_heading_valid) > TRACK_WT_TIMEOUT / 2
+            || trackDataAge(now, &a->track_valid) > TRACK_WT_TIMEOUT / 2
        ) {
         return;
     }
+
+    // wind data calculated when the aircraft turning is often bad
+    // don't attempt to calculate when it is known that the aircraft is in a turn
+    if (trackDataValid(&a->roll_valid) && fabs(a->roll) > 10.0f) {
+        return;
+    }
+    if (trackDataValid(&a->track_rate_valid) && fabs(a->track_rate) > 0.5f) {
+        return;
+    }
+
+    int discard = 0;
+    if (now < a->wind_updated + 700) {
+        // don't do wind calculation more often than necessary, precision isn't THAT good anyhow
+        discard = 1;
+    }
+
+    uint32_t focus = 0x0;
+    if (focus && a->addr == focus) {
+        fprintTime(stderr, now);
+        fprintf(stderr, "  %4"PRIu64" %4"PRIu64" %4"PRIu64" %4"PRIu64" %d\n",
+                trackDataAge(now, &a->tas_valid), trackDataAge(now, &a->gs_valid),
+                trackDataAge(now, &a->true_heading_valid), trackDataAge(now, &a->track_valid),
+                discard);
+    }
+
+    if (discard) {
+        return;
+    }
+
 
     // don't use this code for now
     /*
@@ -3430,18 +3455,29 @@ static void calc_temp(struct aircraft *a, int64_t now) {
     double oat = (fraction * fraction * 288.15) - 273.15;
     double tat = -273.15 + ((oat + 273.15) * (1 + 0.2 * a->mach * a->mach));
 
+    if (oat < -100 || oat > 60) {
+        // Filter out wildly unrealistic temperatures (TAS / Mach pair from
+        // different registers or a misclassified BDS 6,0), same as calc_wind
+        return;
+    }
+
     a->oat = oat;
     a->tat = tat;
     a->oat_updated = now;
     a->tat_updated = now;
 }
 
-static inline int declination(struct aircraft *a, double *dec, int64_t now) {
+static inline int updateDeclination(struct aircraft *a, int64_t now) {
+    double decStorage = 0;
+    double *dec = &decStorage;
     // only update delination every 30 seconds (per plane)
     // it doesn't change that much assuming the plane doesn't move huge distances in that time
     if (now < a->updatedDeclination + 5 * SECONDS) {
-        *dec = a->magneticDeclination;
         return 0;
+    }
+
+    if (!trackDataValid(&a->baro_alt_valid) || !trackDataValid(&a->position_valid)) {
+        return 1;
     }
 
     double year;

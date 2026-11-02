@@ -1,5 +1,5 @@
 PROGNAME=readsb
-READSB_VERSION := "$(shell echo -n `cat version`; { git show -s --format=format: && echo -n ' wiedehopf git: ' && git describe --tags --abbrev --dirty --always && git show -s --format=format:"(committed: %cd)" | tr -cd '[a-z],[A-Z],[0-9],:, ,\-,_,(,)';} || echo -n ' compiled on '`date +%y%m%d` )"
+READSB_VERSION := "$(shell printf '%s' `cat version`; { git show -s --format=format: && printf '%s' ' wiedehopf git: ' && git describe --tags --abbrev --dirty --always && git show -s --format=format:"(committed: %cd)" | tr -cd '[a-z],[A-Z],[0-9],:, ,\-,_,(,)';} || printf '%s' ' compiled on '`date +%y%m%d` )"
 
 RTLSDR ?= no
 BLADERF ?= no
@@ -200,15 +200,17 @@ viewadsb: readsb
 	cp readsb viewadsb
 
 clean:
-	rm -f *.o uat2esnt/*.o compat/clock_gettime/*.o compat/clock_nanosleep/*.o compat/apple/*.o readsb viewadsb cprtests crctests convert_benchmark
+	rm -f *.o uat2esnt/*.o oneoff/*.o compat/clock_gettime/*.o compat/clock_nanosleep/*.o compat/apple/*.o readsb viewadsb cprtests crctests oneoff/convert_benchmark
+
+.PHONY: test cprtest crctest
 
 test: cprtest crctest
 
 cprtest: cprtests
 	./cprtests
 
-crctest: cprtests
-	./cprtests
+crctest: crctests
+	./crctests 1 2
 
 cprtests: cpr.o cprtests.o
 	$(CC) $(CFLAGS) -o $@ $^ -lm
@@ -217,10 +219,10 @@ crctests: crc.c crc.h
 	$(CC) $(CFLAGS) -DCRCDEBUG -o $@ $<
 
 benchmarks: oneoff/convert_benchmark
-	./convert_benchmark
+	./oneoff/convert_benchmark
 
-oneoff/convert_benchmark: oneoff/convert_benchmark.o convert.o util.o
-	$(CC) $(CFLAGS) -o $@ $^ -lm
+oneoff/convert_benchmark: oneoff/convert_benchmark.o convert.o util.o threadpool.o $(COMPAT)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
 
 oneoff/decode_comm_b: oneoff/decode_comm_b.o comm_b.o ais_charset.o
 	$(CC) $(CFLAGS) -o $@ $^ -lm

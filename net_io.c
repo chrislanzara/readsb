@@ -156,6 +156,8 @@ static struct net_service *serviceInit(struct net_service_group *group, const ch
     }
 
     if (!group->services) {
+        fprintf(stderr, "FATAL: group->services alloc failed\n");
+        exit(1);
     }
 
     group->len++;
@@ -406,24 +408,19 @@ static struct client *createSocketClient(struct net_service *service, int fd, ch
 static int sendUUID(struct client *c, int64_t now) {
     struct net_connector *con = c->con;
     // sending UUID for beast_reduce_plus output
-    char uuid[150];
+    char uuid[48];
     uuid[0] = '\0';
     if ((c->sendq && c->sendq_len + 256 < c->sendq_max) && con
             && (con->enable_uuid_ping || Modes.debug_ping || Modes.debug_send_uuid)) {
 
-        int res = -1;
-
         if (con->uuid) {
-            strncpy(uuid, con->uuid, 135);
-            res = strlen(uuid);
-        } else if (Modes.uuidFile) {
-            int fd = open(Modes.uuidFile, O_RDONLY);
-            if (fd != -1) {
-                res = read(fd, uuid, 128);
-                close(fd);
-            }
+            strncpy(uuid, con->uuid, sizeof(uuid));
+        } else if (strlen(Modes.uuid) > 0) {
+            strncpy(uuid, Modes.uuid, sizeof(uuid));
         }
 
+        uuid[sizeof(uuid) - 1] = '\0';
+        int res = strlen(uuid);
         if (res >= 28) {
             if (uuid[res - 1] == '\n') {
                 // remove trailing newline
@@ -435,7 +432,10 @@ static int sendUUID(struct client *c, int64_t now) {
             c->sendq[c->sendq_len++] = 0xE4;
             // uuid is padded with 'f', always send 36 chars
             memset(c->sendq + c->sendq_len, 'f', 36);
-            strncpy(c->sendq + c->sendq_len, uuid, res);
+            // strncpy was throwing STUPID warnings .. so strcpy it is I guess, ty gcc
+            // to make it clear that we copy a max of 48 bytes, zero terminate again
+            uuid[sizeof(uuid) - 1] = '\0';
+            strcpy(c->sendq + c->sendq_len, uuid);
             c->sendq_len += 36;
         } else {
             fprintf(stderr, "ERROR: Not a valid UUID: '%s' (to generate a valid uuid use this command: cat /proc/sys/kernel/random/uuid)\n", uuid);
@@ -833,7 +833,8 @@ void serviceListen(struct net_service *service, char *bind_addr, char *bind_port
         } else {
             //nfds = anetTcpServer(Modes.aneterr, buf, bind_addr, newfds, sizeof (newfds), SOCK_NONBLOCK, getSNDBUF(service), getRCVBUF(service));
             // explicitely setting tcp buffers causes failure of linux tcp window auto tuning ... it just doesn't work well without the auto tuning
-            nfds = anetTcpServer(Modes.aneterr, buf, bind_addr, newfds, sizeof (newfds), SOCK_NONBLOCK, -1, -1);
+            nfds = anetTcpServer(Modes.aneterr, buf, bind_addr, newfds, sizeof (newfds) / sizeof (newfds[0]),
+                    SOCK_NONBLOCK, -1, -1);
             if (nfds == ANET_ERR) {
                 fprintf(stderr, "Error opening the listening port %s (%s): %s\n",
                         buf, service->descr, Modes.aneterr);
@@ -903,6 +904,10 @@ static void initMessageBuffers() {
     }
 }
 
+// Forward declaration: defined further down alongside the rest of the
+// Kinetic protocol support code, but needed here already by modesInitNet().
+static void kineticFilterInit(void);
+
 void modesInitNet(void) {
     initMessageBuffers();
 
@@ -949,6 +954,7 @@ void modesInitNet(void) {
     struct net_service *sbs_in_prio;
     struct net_service *gpsd_in;
     struct net_service *planefinder_in;
+    struct net_service *kinetic_out;
 
     signal(SIGPIPE, SIG_IGN);
 
@@ -963,6 +969,13 @@ void modesInitNet(void) {
 
     beast_out = serviceInit(&Modes.services_out, "Beast TCP output", &Modes.beast_out, beast_heartbeat, no_heartbeat, READ_MODE_BEAST_COMMAND, NULL, handleBeastCommand);
     serviceListen(beast_out, Modes.net_bind_address, Modes.net_output_beast_ports, Modes.net_epfd);
+
+    // No heartbeat: the Kinetic/BaseStation protocol has no ping mechanism
+    // we know of, and no read_handler: readKineticCommand (READ_MODE_KINETIC_COMMAND)
+    // handles the login handshake directly and doesn't need to dispatch further.
+    kinetic_out = serviceInit(&Modes.services_out, "Kinetic TCP output", &Modes.kinetic_out, no_heartbeat, no_heartbeat, READ_MODE_KINETIC_COMMAND, NULL, NULL);
+    serviceListen(kinetic_out, Modes.net_bind_address, Modes.net_output_kinetic_ports, Modes.net_epfd);
+    kineticFilterInit();
 
     beast_reduce_out = serviceInit(&Modes.services_out, "BeastReduce TCP output", &Modes.beast_reduce_out, beast_heartbeat, no_heartbeat, READ_MODE_BEAST_COMMAND, NULL, handleBeastCommand);
     serviceListen(beast_reduce_out, Modes.net_bind_address, Modes.net_output_beast_reduce_ports, Modes.net_epfd);
@@ -991,7 +1004,7 @@ void modesInitNet(void) {
 
     int sbs_port_len = strlen(Modes.net_output_sbs_ports);
     int pos = sbs_port_len - 1;
-    if (sbs_port_len <= 5 && Modes.net_output_sbs_ports[pos] == '5') {
+    if (sbs_port_len > 0 && sbs_port_len <= 5 && Modes.net_output_sbs_ports[pos] == '5') {
 
         char *replay = strdup(Modes.net_output_sbs_ports);
         replay[pos] = '6';
@@ -1028,7 +1041,7 @@ void modesInitNet(void) {
 
     sbs_port_len = strlen(Modes.net_input_sbs_ports);
     pos = sbs_port_len - 1;
-    if (sbs_port_len <= 5 && Modes.net_input_sbs_ports[pos] == '6') {
+    if (sbs_port_len > 0 && sbs_port_len <= 5 && Modes.net_input_sbs_ports[pos] == '6') {
         char *mlat = strdup(Modes.net_input_sbs_ports);
         mlat[pos] = '7';
         serviceListen(sbs_in_mlat, Modes.net_bind_address, mlat, Modes.net_epfd);
@@ -1064,7 +1077,10 @@ void modesInitNet(void) {
         unlink(commandSocketFile);
         snprintf(commandSocket, PATH_MAX, "unix:%s/cmd.sock", Modes.json_dir);
         serviceListen(commandService, Modes.net_bind_address, commandSocket, Modes.net_epfd);
-        chmod(commandSocket, 0600);
+        // commandSocket is "unix:<path>", the chmod has to use the file path
+        if (chmod(commandSocketFile, 0600)) {
+            fprintf(stderr, "command input: chmod %s: %s\n", commandSocketFile, strerror(errno));
+        }
     }
 
     raw_in = serviceInit(&Modes.services_in, "Raw TCP input", NULL, no_heartbeat, raw_heartbeat, READ_MODE_ASCII, "\n", processHexMessage);
@@ -1150,19 +1166,15 @@ void modesInitNet(void) {
             dump_beast_check(mstime());
         }
     }
+
+    Modes.net_initialized = 1;
 }
 
 
 //
 //=========================================================================
 // Accept new connections
-static void modesAcceptClients(struct client *c, int64_t now) {
-    if (!c || !c->acceptSocket)
-        return;
-
-    int listen_fd = c->fd;
-    struct net_service *s = c->service;
-
+static void modesAcceptClients(int listen_fd, struct net_service *s, int64_t now) {
     struct sockaddr_storage storage;
     struct sockaddr *saddr = (struct sockaddr *) &storage;
     socklen_t slen = sizeof(storage);
@@ -1173,15 +1185,16 @@ static void modesAcceptClients(struct client *c, int64_t now) {
 
         if (Modes.modesClientCount > Modes.max_fds_net) {
             // drop new modes clients if the count gets near resource limits
-            anetCloseSocket(c->fd);
+            anetCloseSocket(fd);
             static int64_t antiSpam;
             if (now > antiSpam) {
                 antiSpam = now + 30 * SECONDS;
                 fprintf(stderr, "<3> Can't accept new connection, limited to %d clients, consider increasing ulimit!\n", Modes.max_fds_net);
             }
+            continue;
         }
 
-        c = createSocketClient(s, fd, NULL);
+        struct client *c = createSocketClient(s, fd, NULL);
         if (s->unixSocket && c) {
             strcpy(c->host, s->unixSocket);
             fprintf(stderr, "%s: new c at %s\n", c->service->descr, s->unixSocket);
@@ -1195,6 +1208,13 @@ static void modesAcceptClients(struct client *c, int64_t now) {
             setProxyString(c);
             if (Modes.debug_net && (!Modes.netIngest || c->service->group == &Modes.services_out)) {
                 fprintf(stderr, "%s: new c from %s port %s (fd %d)\n",
+                        c->service->descr, c->host, c->port, fd);
+            }
+            if (c->service->read_mode == READ_MODE_KINETIC_COMMAND) {
+                // Kinetic (BaseStation) clients get a console message unconditionally,
+                // independent of --debug net, so feeder operators can see when a
+                // BaseStation-compatible client (dis)connects without extra debug noise.
+                fprintf(stderr, "%s: Kinetic client connected: %s port %s (fd %d)\n",
                         c->service->descr, c->host, c->port, fd);
             }
         } else {
@@ -1780,6 +1800,12 @@ static char *netTimestamp(char *p, int64_t timestamp) {
 //
 // Write raw output in Beast Binary format with Timestamp to TCP clients
 //
+// Forward declarations: defined further down alongside the rest of the
+// Kinetic protocol support code, but needed here already by
+// modesSendKineticOutput.
+static uint16_t kineticChecksum(const unsigned char *body, int len);
+static void kineticNextTsPrefix(unsigned char out[4]);
+
 static void modesSendBeastOutput(struct modesMessage *mm, struct net_writer *writer) {
     int msgLen = mm->msgbits / 8;
     // 0x1a 0xe3 receiverId(2*8) 0x1a msgType timestamp+signal(2*7) message(2*msgLen)
@@ -1837,6 +1863,259 @@ static void modesSendBeastOutput(struct modesMessage *mm, struct net_writer *wri
             *p++ = ch;
         }
     }
+
+    completeWrite(writer, p);
+}
+
+//
+//=========================================================================
+//
+// Kinetic-output-only filters. These deliberately live entirely within the
+// Kinetic code path (checked inside modesSendKineticOutput() below) and
+// have no effect whatsoever on beast_out/beast_reduce_out/raw_out/sbs_out --
+// filtering happens per-output-format, not globally on the message.
+//
+#define KINETIC_FILTER_MAX_RANGES 64
+
+struct kineticFilterRange {
+    int start;
+    int end;
+};
+
+static struct kineticFilterRange kineticCategoryFilter[KINETIC_FILTER_MAX_RANGES];
+static int kineticCategoryFilterCount = 0;
+
+static struct kineticFilterRange kineticHexcodeFilter[KINETIC_FILTER_MAX_RANGES];
+static int kineticHexcodeFilterCount = 0;
+
+// ADS-B emitter categories are encoded here as letterIndex*8 + digit, where
+// letterIndex is A=0, B=1, C=2, D=3 -- this turns "C0-C7" into a plain
+// integer range [16,23], matching the same scheme used to derive the
+// category from a live message (see kineticMessageCategory() below).
+static int kineticCategoryLetterIndex(char c) {
+    switch (toupper((unsigned char) c)) {
+        case 'A': return 0;
+        case 'B': return 1;
+        case 'C': return 2;
+        case 'D': return 3;
+        default: return -1;
+    }
+}
+
+// Parses a single category token, e.g. "C0", into its encoded integer.
+// Returns 0 on success, -1 on invalid format.
+static int kineticParseCategoryValue(const char *s, int *out) {
+    if (strlen(s) != 2) {
+        return -1;
+    }
+    int letterIndex = kineticCategoryLetterIndex(s[0]);
+    if (letterIndex < 0 || s[1] < '0' || s[1] > '7') {
+        return -1;
+    }
+    *out = letterIndex * 8 + (s[1] - '0');
+    return 0;
+}
+
+// Parses a comma-separated --net-kinetic-filter-category spec such as
+// "C0-C7,A1" into kineticCategoryFilter[]. Exits with an error message on
+// malformed input, same as readsb does for other malformed CLI arguments.
+static void kineticParseCategoryFilter(const char *spec) {
+    if (!spec || !*spec) {
+        return;
+    }
+    char *copy = strdup(spec);
+    char *saveptr = NULL;
+    char *token = strtok_r(copy, ",", &saveptr);
+    while (token) {
+        if (kineticCategoryFilterCount >= KINETIC_FILTER_MAX_RANGES) {
+            fprintf(stderr, "--net-kinetic-filter-category: too many entries (max %d)\n", KINETIC_FILTER_MAX_RANGES);
+            exit(1);
+        }
+        char *dash = strchr(token, '-');
+        int start, end;
+        if (dash) {
+            *dash = 0;
+            if (kineticParseCategoryValue(token, &start) != 0 || kineticParseCategoryValue(dash + 1, &end) != 0) {
+                fprintf(stderr, "--net-kinetic-filter-category: invalid range '%s-%s' (expected e.g. C0-C7)\n", token, dash + 1);
+                exit(1);
+            }
+        } else {
+            if (kineticParseCategoryValue(token, &start) != 0) {
+                fprintf(stderr, "--net-kinetic-filter-category: invalid value '%s' (expected e.g. C0)\n", token);
+                exit(1);
+            }
+            end = start;
+        }
+        if (start > end) {
+            int tmp = start; start = end; end = tmp;
+        }
+        kineticCategoryFilter[kineticCategoryFilterCount].start = start;
+        kineticCategoryFilter[kineticCategoryFilterCount].end = end;
+        kineticCategoryFilterCount++;
+        token = strtok_r(NULL, ",", &saveptr);
+    }
+    free(copy);
+}
+
+// Parses a comma-separated --net-kinetic-filter-hexcode spec such as
+// "3C8E01-3C8E05,3C3EB9" into kineticHexcodeFilter[].
+static void kineticParseHexcodeFilter(const char *spec) {
+    if (!spec || !*spec) {
+        return;
+    }
+    char *copy = strdup(spec);
+    char *saveptr = NULL;
+    char *token = strtok_r(copy, ",", &saveptr);
+    while (token) {
+        if (kineticHexcodeFilterCount >= KINETIC_FILTER_MAX_RANGES) {
+            fprintf(stderr, "--net-kinetic-filter-hexcode: too many entries (max %d)\n", KINETIC_FILTER_MAX_RANGES);
+            exit(1);
+        }
+        char *dash = strchr(token, '-');
+        char *endptr;
+        long start, end;
+        if (dash) {
+            *dash = 0;
+            start = strtol(token, &endptr, 16);
+            if (*endptr != 0 || endptr == token) {
+                fprintf(stderr, "--net-kinetic-filter-hexcode: invalid hex value '%s'\n", token);
+                exit(1);
+            }
+            end = strtol(dash + 1, &endptr, 16);
+            if (*endptr != 0 || endptr == dash + 1) {
+                fprintf(stderr, "--net-kinetic-filter-hexcode: invalid hex value '%s'\n", dash + 1);
+                exit(1);
+            }
+        } else {
+            start = strtol(token, &endptr, 16);
+            if (*endptr != 0 || endptr == token) {
+                fprintf(stderr, "--net-kinetic-filter-hexcode: invalid hex value '%s'\n", token);
+                exit(1);
+            }
+            end = start;
+        }
+        if (start > end) {
+            long tmp = start; start = end; end = tmp;
+        }
+        kineticHexcodeFilter[kineticHexcodeFilterCount].start = (int) start;
+        kineticHexcodeFilter[kineticHexcodeFilterCount].end = (int) end;
+        kineticHexcodeFilterCount++;
+        token = strtok_r(NULL, ",", &saveptr);
+    }
+    free(copy);
+}
+
+// Called once from modesInitNet() after CLI args are parsed.
+static void kineticFilterInit(void) {
+    kineticParseCategoryFilter(Modes.net_kinetic_filter_category);
+    kineticParseHexcodeFilter(Modes.net_kinetic_filter_hexcode);
+}
+
+static int kineticCategoryFiltered(int category) {
+    for (int i = 0; i < kineticCategoryFilterCount; i++) {
+        if (category >= kineticCategoryFilter[i].start && category <= kineticCategoryFilter[i].end) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int kineticHexcodeFiltered(int icao) {
+    for (int i = 0; i < kineticHexcodeFilterCount; i++) {
+        if (icao >= kineticHexcodeFilter[i].start && icao <= kineticHexcodeFilter[i].end) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// Extracts the ADS-B emitter category from a "Aircraft Identification and
+// Category" message (ME Type Code 1-4, first ME byte = msg[4]). Returns -1
+// if this message doesn't carry a category (any other TC).
+static int kineticMessageCategory(const unsigned char *msg) {
+    unsigned char meFirstByte = msg[4];
+    int tc = meFirstByte >> 3;
+    int letterIndex;
+    switch (tc) {
+        case 4: letterIndex = 0; break; // A
+        case 3: letterIndex = 1; break; // B
+        case 2: letterIndex = 2; break; // C
+        case 1: letterIndex = 3; break; // D
+        default: return -1;
+    }
+    return letterIndex * 8 + (meFirstByte & 0x07);
+}
+
+// Write Mode-S long (14 byte) / short (7 byte) messages in Kinetic
+// (SBS-3/BaseStation binary) format to TCP clients. Only DF17/18/19 (ADS-B),
+// other 112-bit DF, and 56-bit DF are forwarded -- Mode A/C is out of scope,
+// same as the standalone JS bridge this is based on.
+static void modesSendKineticOutput(struct modesMessage *mm, struct net_writer *writer) {
+    int msgLen = mm->msgbits / 8;
+    unsigned char type;
+
+    if (msgLen == MODES_LONG_MSG_BYTES) {
+        type = (mm->msgtype == 17 || mm->msgtype == 18 || mm->msgtype == 19) ? 0x01 : 0x05;
+    } else if (msgLen == MODES_SHORT_MSG_BYTES) {
+        type = 0x07;
+    } else {
+        return; // Mode A/C or anything else: out of scope
+    }
+
+    unsigned char *msg = (Modes.net_verbatim ? mm->verbatim : mm->msg);
+
+    // ICAO hexcode filter (Kinetic output only). Applies only to DF types
+    // with an unencrypted 24-bit address field in byte 2-4 (DF11/17/18/19);
+    // for DF4/5/20/21 the address is folded into the parity and not safely
+    // readable here, so those are never touched by this filter.
+    if (kineticHexcodeFilterCount > 0 &&
+            (mm->msgtype == 11 || mm->msgtype == 17 || mm->msgtype == 18 || mm->msgtype == 19)) {
+        int icao = (msg[1] << 16) | (msg[2] << 8) | msg[3];
+        if (kineticHexcodeFiltered(icao)) {
+            return;
+        }
+    }
+
+    // ADS-B emitter category filter (Kinetic output only). Only DF17/18/19
+    // "Aircraft Identification and Category" messages (type byte 0x01,
+    // ME TC 1-4) carry a category; everything else is unaffected.
+    if (kineticCategoryFilterCount > 0 && type == 0x01) {
+        int category = kineticMessageCategory(msg);
+        if (category >= 0 && kineticCategoryFiltered(category)) {
+            return;
+        }
+    }
+
+    unsigned char tsPrefix[4];
+    kineticNextTsPrefix(tsPrefix);
+
+    // Worst case size: DLE STX + fully-stuffed body (type + 4 byte prefix +
+    // up to 14 byte message, every byte potentially doubled) + DLE ETX + 2
+    // byte checksum (checksum bytes themselves are not stuffed).
+    int bodyLen = 1 + 4 + msgLen;
+    char *p = prepareWrite(writer, 2 + 2 * bodyLen + 2 + 2);
+    if (!p)
+        return;
+
+    unsigned char body[1 + 4 + MODES_LONG_MSG_BYTES];
+    body[0] = type;
+    memcpy(body + 1, tsPrefix, 4);
+    memcpy(body + 5, msg, msgLen);
+    uint16_t crc = kineticChecksum(body, bodyLen);
+
+    *p++ = 0x10;
+    *p++ = 0x02;
+    for (int i = 0; i < bodyLen; i++) {
+        unsigned char b = body[i];
+        *p++ = (char) b;
+        if (b == 0x10) {
+            *p++ = (char) b;
+        }
+    }
+    *p++ = 0x10;
+    *p++ = 0x03;
+    *p++ = (char) ((crc >> 8) & 0xFF);
+    *p++ = (char) (crc & 0xFF);
 
     completeWrite(writer, p);
 }
@@ -2027,22 +2306,24 @@ static uint64_t readAsterixTime(char **p) {
 //
 // Read Asterix High Precision Time
 //
+// *timeStamp is in milliseconds; the field holds the fraction of the second (LSB 2^-30 s)
+// and whether the whole second is the same as in *timeStamp, one later or one earlier (FSI)
 static void readAsterixHighPrecisionTime(uint64_t *timeStamp, char **p) {
     uint8_t fsi = (**p & 0xc0) >> 6;
     double offset = ((**p & 0x3f) << 24) + ((*(*p + 1) & 0xff) << 16) + ((*(*p + 2) & 0xff) << 8) + (*(*p + 3) & 0xff);
     (*p) += 4;
-    offset = offset * pow(2, -27);
-    uint64_t wholesecond = (int)(*timeStamp / 1000) * 1000;
+    offset = offset * pow(2, -30);
+    uint64_t wholesecond = (*timeStamp / 1000) * 1000;
     switch(fsi)
     {
     	case 1:
-	    wholesecond += 1;
+	    wholesecond += 1000;
 	    break;
 	case 2:
-	    wholesecond -= 1;
+	    wholesecond -= 1000;
 	    break;
     }
-    *timeStamp = wholesecond + offset;
+    *timeStamp = wholesecond + (uint64_t) (offset * 1000);
 }
 
 //
@@ -2065,10 +2346,14 @@ static int decodeAsterixMessage(struct client *c, char *p, int remote, int64_t n
     mm->sbs_in = 1;
     mm->signalLevel = 0;
     category = *p; // Get the category
+    // readAsterix() has checked that the whole record is in the buffer
+    char *end = p + (((uint8_t) p[1] << 8) | (uint8_t) p[2]);
     p += 3;
+    // discard records whose fields run past their declared length
+#define ASTERIX_NEED(n) do { if (end - p < (n)) return 0; } while (0)
 
     uint8_t fspec[FSPEC_MAX];
-    readFspec(fspec, &p, c->eod);
+    readFspec(fspec, &p, end);
 
     mm->receiverId = c->receiverId;
     if (unlikely(Modes.incrementId)) {
@@ -2078,15 +2363,18 @@ static int decodeAsterixMessage(struct client *c, char *p, int remote, int64_t n
     switch(category){
         case 21: // ADS-B Message
             if(!(fspec[1] & 0x10)){ // no address. this is useless to us
-                return -1;
+                // discard the record, the stream is still valid: readAsterix()
+                // closes the client on any non-zero return
+                return 0;
             }
             if (fspec[0] & 0x80){ // ID021/010 Data Source Identification
+                ASTERIX_NEED(2);
                 p += 2;
             }
             uint8_t addrtype = 3;
             if (fspec[0] & 0x40){ // ID021/040 Target Report Descriptor
                 uint8_t trd[FSPEC_MAX];
-                readFspec(trd, &p, c->eod);
+                readFspec(trd, &p, end);
                 addrtype = (trd[0] & 0xE0) >> 5;
                 if (!(trd[0] & 0x18)){
                     mm->alt_q_bit = 1;
@@ -2099,15 +2387,19 @@ static int decodeAsterixMessage(struct client *c, char *p, int remote, int64_t n
                 }
             }
             if (fspec[0] & 0x20){ // I021/161 Track Number
+                ASTERIX_NEED(2);
                 p += 2;
             }
             if (fspec[0] & 0x10){ // I021/015 Service Identification
+                ASTERIX_NEED(1);
                 p += 1;
             }
             if (fspec[0] & 0x8){ // I021/071 Time of Applicability for Position 3
+                ASTERIX_NEED(3);
                 mm->sysTimestamp = readAsterixTime(&p);
             }
             if (fspec[0] & 0x4){ // I021/130 Position in WGS-84 co-ordinates
+                ASTERIX_NEED(6);
                 int lat = (*p & 0xff) << 16;
                 lat += (*(p + 1) & 0xff) << 8;
                 lat += (*(p + 2) & 0xff);
@@ -2131,12 +2423,13 @@ static int decodeAsterixMessage(struct client *c, char *p, int remote, int64_t n
                 }
             }
             if (fspec[0] & 0x2){ // I021/131 Position in WGS-84 co-ordinates, high res.
-                int lat = (*p & 0xff) << 24;
+                ASTERIX_NEED(8);
+                int lat = (int) ((uint32_t) (*p & 0xff) << 24);
                 lat += (*(p + 1) & 0xff) << 16;
                 lat += (*(p + 2) & 0xff) << 8;
                 lat += (*(p + 3) & 0xff);
                 p += 4;
-                int lon = *p << 24;
+                int lon = (int) ((uint32_t) (uint8_t) *p << 24);
                 lon += (*(p + 1) & 0xff) << 16;
                 lon += (*(p + 2) & 0xff) << 8;
                 lon += (*(p + 3) & 0xff);
@@ -2150,6 +2443,7 @@ static int decodeAsterixMessage(struct client *c, char *p, int remote, int64_t n
                 }
             }
             if (fspec[1] & 0x80){ // I021/072 Time of Applicability for Velocity
+                ASTERIX_NEED(3);
                 if (mm->sysTimestamp == -1){
                     mm->sysTimestamp = readAsterixTime(&p);
                 }
@@ -2158,6 +2452,7 @@ static int decodeAsterixMessage(struct client *c, char *p, int remote, int64_t n
                 }
             }
             if (fspec[1] & 0x40){ // I021/150 Air Speed
+                ASTERIX_NEED(2);
                 uint16_t raw_speed = (*p & 0x7f) << 8;
                 raw_speed += *(p + 1) & 0xff;
                 if (*p & 0x80){ //Mach
@@ -2171,6 +2466,7 @@ static int decodeAsterixMessage(struct client *c, char *p, int remote, int64_t n
                 p += 2;
             }
             if (fspec[1] & 0x20){ // I021/151 True Airspeed
+                ASTERIX_NEED(2);
                 uint16_t raw_speed = (*p & 0x7f) << 8;
                 raw_speed += *(p + 1) & 0xff;
                 if (!(*p & 0x80)){
@@ -2180,12 +2476,14 @@ static int decodeAsterixMessage(struct client *c, char *p, int remote, int64_t n
                 p += 2;
             }
             // I021/080 Target Address
+            ASTERIX_NEED(3);
             mm->addr = (((*p & 0xff) << 16) + ((*(p + 1) & 0xff) << 8) + (*(p + 2) & 0xff)) & 0xffffff;
             if (addrtype == 3){
                 mm->addr |= MODES_NON_ICAO_ADDRESS;
             }
             p += 3;
             if (fspec[1] & 0x8){ // I021/073 Time of Message Reception of Position
+                ASTERIX_NEED((fspec[1] & 0x4) ? 7 : 3);
                 if (mm->cpr_decoded || mm->sbs_pos_valid){
                     uint64_t ts = readAsterixTime(&p);
                     if (fspec[1] & 0x4){ // I021/074 Time of Message Reception of Position=High Precision
@@ -2203,6 +2501,7 @@ static int decodeAsterixMessage(struct client *c, char *p, int remote, int64_t n
                 }
             }
             if (fspec[1] & 0x2){ // I021/075 Time of Message Reception of Velocity
+                ASTERIX_NEED((fspec[2] & 0x80) ? 7 : 3);
                 if (mm->ias_valid || mm->mach_valid || mm->gs_valid){
                     uint64_t ts = readAsterixTime(&p);
                     if (fspec[2] & 0x80){ // I021/076 Time of Message Reception of Velocity=High Precision
@@ -2220,6 +2519,7 @@ static int decodeAsterixMessage(struct client *c, char *p, int remote, int64_t n
                 }
             }
             if (fspec[2] & 0x40){ // I021/140 Geometric Height
+                ASTERIX_NEED(2);
                 int16_t raw_alt = (((*p & 0xff) << 8) + (*(p + 1) & 0xff));
                 double alt = raw_alt * 6.25;
                 if (alt >= -1500 && alt <= 150000){
@@ -2240,7 +2540,7 @@ static int decodeAsterixMessage(struct client *c, char *p, int remote, int64_t n
             uint8_t gva = 0;
             //uint8_t pic;
             if (fspec[2] & 0x20){ // I021/090 Quality Indicators
-                readFspec(qi, &p, c->eod);
+                readFspec(qi, &p, end);
                 //nucp_or_nic = (qi[0] & 0x1e) >> 1;
                 nucr_or_nacv = (qi[0] & 0xe0) >> 5;
                 mm->accuracy.nac_v_valid = true;
@@ -2268,6 +2568,7 @@ static int decodeAsterixMessage(struct client *c, char *p, int remote, int64_t n
                 }
             }
             if (fspec[2] & 0x10){ // I021/210 MOPS Version
+                ASTERIX_NEED(1);
                 mm->opstatus.valid = true;
                 mm->opstatus.version = ((*p) & 0x38) >> 3;
                 uint8_t ltt = (*p) & 0x7;
@@ -2322,18 +2623,21 @@ static int decodeAsterixMessage(struct client *c, char *p, int remote, int64_t n
                 }
             }
             if (fspec[2] & 0x8){ // I021/070 Mode 3/A Code
+                ASTERIX_NEED(2);
                 mm->squawkHex = (((*p & 0xe) << 11) + ((*p & 0x1) << 10) + ((*(p + 1) & 0xC0) << 2) + ((*(p + 1) & 0x38) << 1) + ((*(p + 1) & 0x7))) ;
                 mm->squawkDec = squawkHex2Dec(mm->squawkHex);
                 mm->squawk_valid = true;
                 p += 2;
             }
             if (fspec[2] & 0x4){ // I021/230 Roll Angle
+                ASTERIX_NEED(2);
                 int16_t roll = ((*p & 0xff) << 8) + (*(p + 1) & 0xff);
                 mm->roll = roll * 0.01;
                 mm->roll_valid = true;
                 p += 2;
             }
             if (fspec[2] & 0x2){ // I021/145 Flight Level
+                ASTERIX_NEED(2);
                 int16_t alt = ((*p & 0xff) << 8) + (*(p + 1) & 0xff);
                 mm->baro_alt_valid = true;
                 mm->baro_alt = alt * 25;
@@ -2341,6 +2645,7 @@ static int decodeAsterixMessage(struct client *c, char *p, int remote, int64_t n
                 p += 2;
             }
             if (fspec[3] & 0x80){ // I021/152 Magnetic Heading
+                ASTERIX_NEED(2);
                 mm->heading_valid = true;
                 mm->heading_type = HEADING_MAGNETIC;
                 uint16_t heading = ((*p & 0xff) << 8) + (*(p + 1) & 0xff);
@@ -2348,6 +2653,7 @@ static int decodeAsterixMessage(struct client *c, char *p, int remote, int64_t n
                 p += 2;
             }
             if (fspec[3] & 0x40){ // I021/200 Target Status
+                ASTERIX_NEED(1);
                 mm->spi_valid = true;
                 mm->alert_valid = true;
                 mm->emergency_valid = true;
@@ -2359,6 +2665,7 @@ static int decodeAsterixMessage(struct client *c, char *p, int remote, int64_t n
                 p++;
             }
             if (fspec[3] & 0x20){ // ID021/155 Barometric Vertical Rate
+                ASTERIX_NEED(2);
                 if (*p & 0x80){ //range exceeded
                     p += 2;
                 }
@@ -2370,6 +2677,7 @@ static int decodeAsterixMessage(struct client *c, char *p, int remote, int64_t n
                 }
             }
             if (fspec[3] & 0x10){ // ID021/157 Geometric Vertical Rate
+                ASTERIX_NEED(2);
                 if (*p & 0x80){ //range exceeded
                     p += 2;
                 }
@@ -2381,6 +2689,7 @@ static int decodeAsterixMessage(struct client *c, char *p, int remote, int64_t n
                 }
             }
             if (fspec[3] & 0x8){ // ID021/160 Airborne Ground Vector
+                ASTERIX_NEED(4);
                 if (*p & 0x80){ //range exceeded
                     p += 4;
                 }
@@ -2397,15 +2706,18 @@ static int decodeAsterixMessage(struct client *c, char *p, int remote, int64_t n
                 }
             }
             if (fspec[3] & 0x4){ // ID021/165 Track Angle Rate
+                ASTERIX_NEED(2);
                 p += 2;
             }
             if (fspec[3] & 0x2){ // ID021/077 Time of Report Transmission
+                ASTERIX_NEED(3);
                 uint64_t tt = readAsterixTime(&p);
                 if (mm->sysTimestamp == -1){
                     mm->sysTimestamp = tt;
                 }
             }
             if (fspec[4] & 0x80){ // ID021/170 Target Identification
+                ASTERIX_NEED(6);
                 uint64_t cs = ((uint64_t)(*p & 0xff) << 40) + ((uint64_t)(*(p + 1) & 0xff) << 32) + ((uint64_t)(*(p + 2) & 0xff) << 24) + ((uint64_t)(*(p + 3) & 0xff) << 16) + ((uint64_t)(*(p + 4) & 0xff) << 8) + (uint64_t)(*(p + 5) & 0xff);
                 char *callsign = mm->callsign;
                 callsign[0] = ais_charset[((cs & 0xFC0000000000) >> 42)];
@@ -2434,6 +2746,7 @@ static int decodeAsterixMessage(struct client *c, char *p, int remote, int64_t n
                 p += 6;
             }
             if (fspec[4] & 0x40){ // ID021/020 Emitter Category
+                ASTERIX_NEED(1);
                 int tc = 0;
                 int ca = 0;
                 uint8_t ecat = *p++ & 0xFF;
@@ -2506,10 +2819,30 @@ static int decodeAsterixMessage(struct client *c, char *p, int remote, int64_t n
 
             if (fspec[4] & 0x20) { // I021/220 Met Information
                 uint8_t met[FSPEC_MAX];
-                readFspec(met, &p, c->eod);
+                readFspec(met, &p, end);
+
+                // skip the fields present in the primary subfield, otherwise
+                // the following items are read from the met data
+                if (met[0] & 0x80) { // WS Wind Speed
+                    ASTERIX_NEED(2);
+                    p += 2;
+                }
+                if (met[0] & 0x40) { // WD Wind Direction
+                    ASTERIX_NEED(2);
+                    p += 2;
+                }
+                if (met[0] & 0x20) { // TMP Temperature
+                    ASTERIX_NEED(2);
+                    p += 2;
+                }
+                if (met[0] & 0x10) { // TRB Turbulence
+                    ASTERIX_NEED(1);
+                    p += 1;
+                }
             }
 
             if (fspec[4] & 0x10) { // I021/146 Selected Altitude
+                ASTERIX_NEED(2);
                 if (*p & 0x80 && *p & 0x60) {
                     int16_t alt = (*p & 0x1F) << 8;
                     alt += *(p + 1) & 0xFF;
@@ -2535,6 +2868,7 @@ static int decodeAsterixMessage(struct client *c, char *p, int remote, int64_t n
     //mm->decoded_nic = 0;
     //mm->decoded_rc = RC_UNKNOWN;
     return 0;
+#undef ASTERIX_NEED
 }
 
 
@@ -3242,7 +3576,9 @@ static int decodeSbsLine(struct client *c, char *line, int remote, int64_t now, 
     // field 13, groundspeed
     if (t[13] && strlen(t[13]) > 0) {
         double tmp = strtod(t[13], &endptr);
-        if (endptr != t[13] && isfinite(tmp)) {
+        // 1e308 is a finite double but becomes inf when stored in the float
+        // below, which ends up as "gs":inf in aircraft.json
+        if (endptr != t[13] && isfinite(tmp) && tmp >= 0 && tmp <= 6000) {
             mm->gs_valid = 1;
             mm->gs.v0 = tmp;
         } else {
@@ -3324,10 +3660,10 @@ static int decodeSbsLine(struct client *c, char *line, int remote, int64_t now, 
                 mm->mlatEPU = UINT16_MAX;
 
             //fprintf(stderr, "mlatEPU: %d\n", mm->mlatEPU);
-        } else if (!strcmp(t[21], "0")) {
+        } else if (!strcmp(t[20], "0")) {
             mm->squawk_emergency_valid = 1;
             mm->squawk_emergency = 0;
-        } else if (!strcmp(t[21], "-1")) {
+        } else if (!strcmp(t[20], "-1")) {
             mm->squawk_emergency_valid = 1;
             mm->squawk_emergency = 1;
         }
@@ -3335,7 +3671,7 @@ static int decodeSbsLine(struct client *c, char *line, int remote, int64_t now, 
 
     // Field 21 is the Squawk Ident flag
     if (t[21] && strlen(t[21]) > 0) {
-        if (!strcmp(t[21], "1")) {
+        if (!strcmp(t[21], "1") || !strcmp(t[21], "-1")) {
             mm->spi_valid = 1;
             mm->spi = 1;
         } else if (!strcmp(t[21], "0")) {
@@ -3846,6 +4182,128 @@ void sendBeastSettings(int fd, const char *settings) {
     anetWrite(fd, buf, len);
 }
 
+//
+//=========================================================================
+//
+// Kinetic (SBS-3/BaseStation binary) protocol support.
+//
+// Reverse-engineered against a real tcpdump capture (BaseStation <-> real
+// SBS-3) -- see the standalone beast-to-kinetic-bridge.js prototype this
+// port is based on for the original derivation notes. Summary:
+//
+// - Framing is DLE/STX ... DLE/ETX + 2 byte checksum, with DLE (0x10) byte
+//   stuffing (doubled) inside the body, same idea as Beast's 0x1a stuffing.
+// - Checksum is CRC-16/CCITT (poly 0x1021, init 0x0000, no reflect, no
+//   xorout -- i.e. "CRC-16/XMODEM"), computed over Type-byte + payload
+//   BEFORE stuffing.
+// - The login reply pair below is byte-identical to what a real SBS-3
+//   sends; we don't need to understand its contents, just replay it once
+//   the client (BaseStation) sends its login frame (type 0x17).
+// - Data packet type depends on the Mode-S DF field, not always 0x01:
+//     0x01 KAL_PKT_MODES_ADSB  -- DF 17/18/19 (112 bit)
+//     0x05 KAL_PKT_MODES_LONG  -- other 112 bit DF (20/21/16/...)
+//     0x07 KAL_PKT_MODES_SHORT -- 56 bit DF 0-15
+// - Prefix before the raw Mode-S bytes is 1 unused byte (0x00) + a 3 byte
+//   rolling timestamp (50ns resolution per the Kinetic API Reference 1.03,
+//   absolute value not safety relevant for BaseStation).
+//
+static const unsigned char kineticLoginReplyDeviceInfo[] = {
+    0x10, 0x02, 0x26, 0xe9, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x20, 0x20,
+    0x53, 0x42, 0x53, 0x2d, 0x33, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20,
+    0x20, 0x20, 0x20, 0x20, 0x77, 0x00, 0x03, 0x01, 0x00, 0x00, 0x01, 0x13,
+    0x00, 0x10, 0x03, 0x89, 0x42,
+};
+static const unsigned char kineticLoginReplyReady[] = {
+    0x10, 0x02, 0x2c, 0x80, 0x10, 0x03, 0xd2, 0x03,
+};
+
+// CRC-16/CCITT (poly 0x1021, init 0x0000), verified against a real
+// modesmixer2 capture: 100% match across all observed packet types
+// (0x01, 0x05, 0x07, 0x20) plus the hardcoded login replies (0x26, 0x2c).
+static uint16_t kineticChecksum(const unsigned char *body, int len) {
+    uint16_t crc = 0x0000;
+    for (int i = 0; i < len; i++) {
+        crc ^= (uint16_t) body[i] << 8;
+        for (int bit = 0; bit < 8; bit++) {
+            crc = (crc & 0x8000) ? (uint16_t) ((crc << 1) ^ 0x1021) : (uint16_t) (crc << 1);
+        }
+    }
+    return crc;
+}
+
+// 3-byte rolling timestamp, wraps at 0xFFFFFF -- see comment above.
+static uint32_t kineticTsCounter24 = 0;
+static void kineticNextTsPrefix(unsigned char out[4]) {
+    kineticTsCounter24 = (kineticTsCounter24 + 1) & 0xFFFFFF;
+    out[0] = 0x00;
+    out[1] = (kineticTsCounter24 >> 16) & 0xFF;
+    out[2] = (kineticTsCounter24 >> 8) & 0xFF;
+    out[3] = kineticTsCounter24 & 0xFF;
+}
+
+// Scan a connecting Kinetic (BaseStation) client's inbound buffer for a
+// login frame (type 0x17) and reply with the two hardcoded login packets
+// once seen. We don't care about anything else the client sends us, so
+// this intentionally does not dispatch to a generic read_handler -- once
+// logged in there is nothing more to parse from this client.
+static int readKineticCommand(struct client *c, int64_t now, struct messageBuffer *mb) {
+    MODES_NOTUSED(now);
+    MODES_NOTUSED(mb);
+
+    if (c->kineticLoggedIn) {
+        // Nothing left to do once logged in -- discard anything further.
+        c->som = c->eod;
+        return 0;
+    }
+
+    char *p;
+    // Find the next DLE/STX (0x10 0x02) frame start, skipping garbage before it.
+    while (c->som < c->eod - 1 && ((p = memchr(c->som, 0x10, c->eod - 1 - c->som)) != NULL)) {
+        if ((unsigned char) p[1] != 0x02) {
+            c->som = p + 1;
+            continue;
+        }
+
+        char *q = p + 2;
+        int found = 0;
+        while (q < c->eod - 1) {
+            if ((unsigned char) q[0] == 0x10) {
+                if ((unsigned char) q[1] == 0x10) {
+                    q += 2;
+                    continue;
+                }
+                if ((unsigned char) q[1] == 0x03) {
+                    found = 1;
+                    break;
+                }
+            }
+            q++;
+        }
+        if (!found || c->eod - q < 4) {
+            // Frame (or its trailing checksum) not fully received yet, wait for more data.
+            c->som = p;
+            return 0;
+        }
+
+        unsigned char type = (unsigned char) p[2];
+        if (type == 0x17) {
+            anetWrite(c->fd, (char *) kineticLoginReplyDeviceInfo, sizeof(kineticLoginReplyDeviceInfo));
+            anetWrite(c->fd, (char *) kineticLoginReplyReady, sizeof(kineticLoginReplyReady));
+            c->kineticLoggedIn = 1;
+            fprintf(stderr, "%s: Kinetic client logged in: %s port %s (fd %d)\n",
+                    c->service->descr, c->host, c->port, c->fd);
+            c->som = q + 4;
+            return 0;
+        }
+        // Some other frame type we don't care about -- skip it and keep scanning.
+        c->som = q + 4;
+    }
+    if (c->som < c->eod - 1) {
+        c->som = c->eod - 1;
+    }
+    return 0;
+}
+
 static int handle_gpsd(struct client *c, char *p, int remote, int64_t now, struct messageBuffer *mb) {
     MODES_NOTUSED(c);
     MODES_NOTUSED(remote);
@@ -3962,6 +4420,10 @@ static int handleCommandSocket(struct client *c, char *p, int remote, int64_t no
     MODES_NOTUSED(mb);
     char *saveptr = NULL;
     char *cmd = strtok_r(p, " ", &saveptr);
+    if (!cmd) {
+        // empty line, nothing to do
+        return 0;
+    }
     if (strcmp(cmd, "deleteTrace") == 0) {
         char *t1 = strtok_r(NULL, " ", &saveptr);
         char *t2 = strtok_r(NULL, " ", &saveptr);
@@ -4099,12 +4561,14 @@ static int decodeBinMessage(struct client *c, char *p, int remote, int64_t now, 
      */
     mm->remote = remote;
 
-    mm->timestamp = 0;
     // Grab the timestamp (big endian format)
-    for (j = 0; j < 6; j++) {
-        ch = *p++;
-        mm->timestamp = mm->timestamp << 8 | (ch & 255);
-    }
+    mm->timestamp = ((uint64_t) (unsigned char) p[0] << 40)
+        | ((uint64_t) (unsigned char) p[1] << 32)
+        | ((uint64_t) (unsigned char) p[2] << 24)
+        | ((uint64_t) (unsigned char) p[3] << 16)
+        | ((uint64_t) (unsigned char) p[4] << 8)
+        | ((uint64_t) (unsigned char) p[5]);
+    p += 6;
 
     // record reception time as the time we read it.
     mm->sysTimestamp = now;
@@ -4126,9 +4590,8 @@ static int decodeBinMessage(struct client *c, char *p, int remote, int64_t now, 
             Modes.stats_current.strong_signal_count++; // signal power above -3dBFS
     }
 
-    for (j = 0; j < msgLen; j++) { // and the data
-        msg[j] = ch = *p++;
-    }
+    memcpy(msg, p, msgLen); // the data, the escapes are already removed
+    p += msgLen;
 
     int result = -10;
     if (msgLen == MODEAC_MSG_BYTES) { // ModeA or ModeC
@@ -4354,10 +4817,12 @@ static int decodeHexMessage(struct client *c, char *hex, int64_t now, struct mod
         hex[l - 1] = '\0';
         l--;
     }
-    while (isspace(*hex)) {
+    while (l && isspace(*hex)) {
         hex++;
         l--;
     }
+    if (l <= 0)
+        return (0); // empty line
 
     // https://www.aerobits.pl/wp-content/uploads/2021/07/OEM_MC_Datasheet.pdf
     // *RAW_FRAME;(SIGS,SIGQ,TS)\r\n
@@ -4426,14 +4891,23 @@ static int decodeHexMessage(struct client *c, char *hex, int64_t now, struct mod
 
                 if (l < 12)
                     return (0);
+                // replaces a timestamp from an Aerobits (SIGS,SIGQ,TS) suffix
+                mm->timestamp = 0;
                 for (j = 0; j < 12; j++) {
-                    mm->timestamp = (mm->timestamp << 4) | hexDigitVal(*hex);
+                    int digit = hexDigitVal(*hex);
+                    if (digit < 0)
+                        return (0);
+                    mm->timestamp = (mm->timestamp << 4) | digit;
                     hex++;
                     l--;
                 }
                 if (l < 2)
                     return (0);
-                mm->signalLevel = ((hexDigitVal(hex[0]) << 4) | hexDigitVal(hex[1])) / 255.0;
+                int high = hexDigitVal(hex[0]);
+                int low = hexDigitVal(hex[1]);
+                if (high < 0 || low < 0)
+                    return (0);
+                mm->signalLevel = ((high << 4) | low) / 255.0;
                 hex += 2;
                 l -= 2;
                 mm->signalLevel = mm->signalLevel * mm->signalLevel;
@@ -4449,8 +4923,13 @@ static int decodeHexMessage(struct client *c, char *hex, int64_t now, struct mod
 
                 if (l <= 12) // if we have only enough hex for the timestamp or less it's invalid
                     return (0);
+                // replaces a timestamp from an Aerobits (SIGS,SIGQ,TS) suffix
+                mm->timestamp = 0;
                 for (j = 0; j < 12; j++) {
-                    mm->timestamp = (mm->timestamp << 4) | hexDigitVal(*hex);
+                    int digit = hexDigitVal(*hex);
+                    if (digit < 0)
+                        return (0);
+                    mm->timestamp = (mm->timestamp << 4) | digit;
                     hex++;
                 }
 
@@ -4845,6 +5324,12 @@ static int readClient(struct client *c, int64_t now) {
             }
             fprintf(stderr, "%s: Remote server disconnected: %s port %s (fd %d, SendQ %d, RecvQ %d)\n",
                     c->service->descr, c->con->address, c->con->port, c->fd, c->sendq_len, c->buflen);
+        } else if (c->service->read_mode == READ_MODE_KINETIC_COMMAND) {
+            // Always report Kinetic client disconnects, regardless of --debug net,
+            // and note whether the login handshake ever completed.
+            fprintf(stderr, "%s: Kinetic client disconnected: %s port %s (fd %d, SendQ %d, RecvQ %d)%s\n",
+                    c->service->descr, c->host, c->port, c->fd, c->sendq_len, c->buflen,
+                    c->kineticLoggedIn ? "" : " (never logged in)");
         } else if (Modes.debug_net && !Modes.netIngest) {
             fprintf(stderr, "%s: Listen client disconnected: %s port %s (fd %d, SendQ %d, RecvQ %d)\n",
                     c->service->descr, c->host, c->port, c->fd, c->sendq_len, c->buflen);
@@ -5017,8 +5502,18 @@ static int readAsterix(struct client *c, int64_t now, struct messageBuffer *mb) 
         // where char is signed — a byte value > 127 would otherwise sign-extend
         // to a negative int before the shift, corrupting msgLen.
         uint16_t msgLen = ((uint8_t)*(p + 1) << 8) | (uint8_t)*(p + 2);
-        if (msgLen < 3 || c->som + msgLen > c->eod) {
-            // invalid or incomplete messages
+        if (msgLen < 3) {
+            // a length below 3 can never become valid, and ASTERIX has no
+            // resynchronisation marker, so the stream is lost
+            if (Modes.debug_net) {
+                fprintf(stderr, "%s: Closing connection from %s port %s, invalid ASTERIX length %u\n",
+                        c->service->descr, c->host, c->port, msgLen);
+            }
+            modesCloseClient(c);
+            return -1;
+        }
+        if (c->som + msgLen > c->eod) {
+            // incomplete message, wait for more data
             break;
         }
         char *end = c->som + msgLen;
@@ -5124,7 +5619,11 @@ static int readBeast(struct client *c, int64_t now, struct messageBuffer *mb) {
         fprintf(stderr, " orphaned bytes: %5d orphaned for: %8.3f\n", c->orphaned_bytes, (now - c->orphaned_bytes_ts) / 1000.0);
     }
 
-    while (c->som < c->eod && ((p = memchr(c->som, (char) 0x1a, c->eod - c->som)) != NULL)) { // The first byte of buffer 'should' be 0x1a
+    while (c->som < c->eod) {
+        // the next byte usually is the 0x1a we are looking for, skip the memchr call then
+        p = ((unsigned char) *c->som == 0x1a) ? c->som : memchr(c->som, (char) 0x1a, c->eod - c->som);
+        if (!p)
+            break;
 
         if (p > c->som) {
             garbageIncrement(c, p - c->som, __LINE__);
@@ -5157,9 +5656,7 @@ static int readBeast(struct client *c, int64_t now, struct messageBuffer *mb) {
             p++;
 
             int64_t ts;
-            // need the byte after the timestamp too: it is read below, and if the buffer ended
-            // at the timestamp that byte is stale, which skipped the next message
-            if (p + sizeof(int64_t) >= c->eod) {
+            if (p + sizeof(int64_t) > c->eod) {
                 break;
             }
 
@@ -5195,6 +5692,10 @@ static int readBeast(struct client *c, int64_t now, struct messageBuffer *mb) {
             //fprintf(stderr, "%ld %ld\n", (long) now, (long) (c->eod - c->som));
 
             c->som = p; // set start of next message
+            if (p >= c->eod) {
+                // the synthetic timestamp was the last thing in the buffer
+                break;
+            }
             if (*p != 0x1A) {
                 //fprintf(stderr, "..\n");
                 c->som++;
@@ -5344,7 +5845,8 @@ static int readBeast(struct client *c, int64_t now, struct messageBuffer *mb) {
                     // incomplete uuid
                     break;
                 } else {
-                    // malformed uuid
+                    // malformed uuid, skip
+                    c->som++;
                     continue;
                 }
             }
@@ -5609,6 +6111,11 @@ static int processClient(struct client *c, int64_t now, struct messageBuffer *mb
         if (res != 0) {
             return res;
         }
+    } else if (read_mode == READ_MODE_KINETIC_COMMAND) {
+        int res = readKineticCommand(c, now, mb);
+        if (res != 0) {
+            return res;
+        }
     }
 
     if (!c->receiverIdLocked && (c->bytesReceived > 512 || now > c->connectedSince + 10000)) {
@@ -5757,12 +6264,30 @@ static void serviceFreeClients(struct net_service *s) {
 }
 
 // Unlink and free closed clients
-static void netFreeClients() {
-    for (struct net_service *service = Modes.services_out.services; service->descr; service++) {
-        serviceFreeClients(service);
+void netFreeClientsReceivers(int64_t interval) {
+    if (Modes.net_initialized) {
+        for (struct net_service *service = Modes.services_out.services; service->descr; service++) {
+            serviceFreeClients(service);
+        }
+        for (struct net_service *service = Modes.services_in.services; service->descr; service++) {
+            serviceFreeClients(service);
+        }
     }
-    for (struct net_service *service = Modes.services_in.services; service->descr; service++) {
-        serviceFreeClients(service);
+
+    if (Modes.receiverTable) {
+        static uint32_t upcount;
+        int nParts = RECEIVER_MAINTENANCE_INTERVAL / interval;
+        receiverTimeout((upcount % nParts), nParts, mstime());
+        upcount++;
+
+        if (Modes.receiverCount > Modes.receiver_table_size * 3 / 4 && Modes.receiver_table_hash_bits < 16) {
+            // we clear the table, rehashing would be nicer but more complex
+            // this should be fine
+            receiverCleanup();
+            Modes.receiver_table_hash_bits = 16;
+            receiverInit();
+            fprintf(stderr, "receiverTable table size increased to: %d\n", Modes.receiver_table_size);
+        }
     }
 }
 
@@ -5797,7 +6322,7 @@ static void handleEpoll(struct net_service_group *group, struct messageBuffer *m
 
         if (cl->acceptSocket || cl->net_connector_dummyClient) {
             if (cl->acceptSocket) {
-                modesAcceptClients(cl, mstime());
+                modesAcceptClients(cl->fd, cl->service, mstime());
             }
             if (cl->net_connector_dummyClient) {
                 checkServiceConnected(cl->con, mstime());
@@ -5953,7 +6478,7 @@ void modesNetPeriodicWork(void) {
     }
 
     /* Beast input from local Modes-S Beast via USB */
-    if (Modes.sdrInitialized && (Modes.sdr_type == SDR_MODESBEAST || Modes.sdr_type == SDR_GNS)) {
+    if (Modes.sdrInitialized && (Modes.sdr_type == SDR_MODESBEAST || Modes.sdr_type == SDR_GNS) && Modes.beast_fd >= 0) {
         if (!Modes.serial_client) {
             if (1 || Modes.debug_serial) {
                 fprintTimePrecise(stderr, mstime());
@@ -5973,6 +6498,10 @@ void modesNetPeriodicWork(void) {
         if (!Modes.serial_client->service) {
             fprintf(stderr, "Serial client closed unexpectedly, exiting!\n");
             setExit(2);
+            // netFreeClients() frees the closed client and its fd is closed:
+            // neither may be used again while the exit is pending
+            Modes.serial_client = NULL;
+            Modes.beast_fd = -1;
         }
     }
 
@@ -6014,31 +6543,6 @@ void modesNetPeriodicWork(void) {
             Modes.next_reconnect_callback = now + Modes.net_connector_delay_min;
         }
         serviceReconnectCallback(now);
-    }
-
-    static int64_t next_free_clients;
-    int64_t free_client_interval = 1 * SECONDS;
-    if (now > next_free_clients) {
-        next_free_clients = now + free_client_interval;
-
-
-        netFreeClients();
-
-        if (Modes.receiverTable) {
-            static uint32_t upcount;
-            int nParts = RECEIVER_MAINTENANCE_INTERVAL / free_client_interval;
-            receiverTimeout((upcount % nParts), nParts, now);
-            upcount++;
-
-            if (Modes.receiverCount > Modes.receiver_table_size * 3 / 4 && Modes.receiver_table_hash_bits < 16) {
-                // we clear the table, rehashing would be nicer but more complex
-                // this should be fine
-                receiverCleanup();
-                Modes.receiver_table_hash_bits = 16;
-                receiverInit();
-                fprintf(stderr, "receiverTable table size increased to: %d\n", Modes.receiver_table_size);
-            }
-        }
     }
 
     int64_t elapsed3 = lapWatch(&watch);
@@ -6324,7 +6828,7 @@ static char *read_uuid(struct client *c, char *p, char *eod) {
 
 static void outputMessage(struct modesMessage *mm) {
     // filter messages with unwanted DF types (sbs_in are unknown DF type, filter them all, this is arbitrary but no one cares anyway)
-    if (Modes.filterDF && (mm->sbs_in || !(Modes.filterDFbitset & (1 << mm->msgtype)))) {
+    if (Modes.filterDF && (mm->sbs_in || !(Modes.filterDFbitset & (1u << mm->msgtype)))) {
         return;
     }
     if (!Modes.net) {
@@ -6378,6 +6882,12 @@ static void outputMessage(struct modesMessage *mm) {
             if (mm->reduce_forward && Modes.beast_reduce_out.connections) {
                 modesSendBeastOutput(mm, &Modes.beast_reduce_out);
             }
+        }
+        // Kinetic output has its own mlat-forwarding switch (--net-kinetic-forward-mlat),
+        // independent of --forward-mlat which only affects beast_out/beast_reduce_out.
+        if (!noforward && (!is_mlat || Modes.forward_mlat_kinetic) && (mm->correctedbits < 2 || Modes.net_verbatim)
+                && Modes.kinetic_out.connections) {
+            modesSendKineticOutput(mm, &Modes.kinetic_out);
         }
         if (Modes.dump_fw && (!Modes.dump_reduce || mm->reduce_forward)) {
             modesDumpBeastData(mm);

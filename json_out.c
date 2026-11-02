@@ -677,6 +677,25 @@ char *sprintAircraftObject(char *p, char *end, struct aircraft *a, int64_t now, 
         p = safe_snprintf(p, end, ",\"tas\":%u", a->tas);
     if (trackDataValid(&a->mach_valid))
         p = safe_snprintf(p, end, ",\"mach\":%.3f", a->mach);
+
+    // ages of the air-data fields (seconds): TAS comes from BDS 5,0 and Mach from BDS 6,0,
+    // consumers deriving temperature need to know how far apart the two samples are.
+    if (trackDataValid(&a->tas_valid) && printMode !=1 && Modes.json_age_fields) {
+        p = safe_snprintf(p, end, ",\"tas_age\":%.1f", trackDataAge(now, &a->tas_valid) / 1000.0);
+    }
+    if (trackDataValid(&a->mach_valid) && printMode !=1 && Modes.json_age_fields) {
+        p = safe_snprintf(p, end, ",\"mach_age\":%.1f", trackDataAge(now, &a->mach_valid) / 1000.0);
+    }
+    if (trackDataValid(&a->gs_valid) && printMode !=1 && Modes.json_age_fields) {
+        p = safe_snprintf(p, end, ",\"gs_age\":%.1f", trackDataAge(now, &a->gs_valid) / 1000.0);
+    }
+    if (trackDataValid(&a->track_valid) && printMode !=1 && Modes.json_age_fields) {
+        p = safe_snprintf(p, end, ",\"track_age\":%.1f", trackDataAge(now, &a->track_valid) / 1000.0);
+    }
+    if (trackDataValid(&a->true_heading_valid) && printMode !=1 && Modes.json_age_fields) {
+        p = safe_snprintf(p, end, ",\"true_heading_age\":%.1f", trackDataAge(now, &a->true_heading_valid) / 1000.0);
+    }
+
     if (now < a->wind_updated + TRACK_EXPIRE && abs(a->wind_altitude - a->baro_alt) < 500) {
         p = safe_snprintf(p, end, ",\"wd\":%.0f", a->wind_direction);
         p = safe_snprintf(p, end, ",\"ws\":%.0f", a->wind_speed);
@@ -2318,6 +2337,7 @@ struct char_buffer generateClientsJson() {
         for (struct client *c = service->clients; c; c = c->next) {
             if (!c->service)
                 continue;
+            // don't dereference c->service, it could become NULL during a client close
 
             // check if we have enough space
             if ((p + 1000) >= end) {
@@ -2333,7 +2353,7 @@ struct char_buffer generateClientsJson() {
             //fprintf(stderr, "printing rId %016"PRIx64"%016"PRIx64" %s\n", c->receiverId, c->receiverId2, uuid);
 
             double elapsed = (now - c->connectedSince) / 1000.0;
-            int reduceSignaled = c->service->writer == &Modes.beast_in
+            int reduceSignaled = service->writer == &Modes.beast_in
                 && c->pingReceived + 120 * SECONDS > now;
             p = safe_snprintf(p, end, "[\"%s\",\"%49s\",%6.2f,%6.0f,%8.3f,%7.3f, %d,%5.0f, %10lld],\n",
                     uuid,

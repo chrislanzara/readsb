@@ -271,6 +271,7 @@ void threadCreate(threadT *thread, const pthread_attr_t *attr, void *(*start_rou
         fprintf(stderr, "<3>FATAL: threadCreate() pthread_create() failed: %s\n", strerror(res));
         setExit(2);
     }
+    thread->created = 1;
     thread->joined = 0;
     thread->joinFailed = 0;
 }
@@ -302,8 +303,9 @@ void threadTimedWait(threadT *thread, struct timespec *ts, int64_t increment) {
 }
 
 void threadSignalJoin(threadT *thread) {
-    if (thread->joined)
+    if (thread->joined || !thread->created) {
         return;
+    }
     int err = 0;
     #ifdef __APPLE__
     pthread_join(thread->pthread, NULL);
@@ -1178,9 +1180,6 @@ int32_t tokenize(char **restrict stringp, char *restrict delim, char **restrict 
 }
 
 void spinLock(volatile atomic_int *lock) {
-    // C11 atomic_compare_exchange_weak's "expected" parameter is the
-    // non-atomic type (int*, not atomic_int*) per the standard -- glibc's
-    // headers tolerate the atomic_int form, Apple's Clang correctly rejects it.
     int expected;
     int calls = 0;
     do {
